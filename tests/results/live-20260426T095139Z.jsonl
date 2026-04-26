@@ -1,0 +1,30 @@
+{
+  "scenario": "live_round_trip",
+  "timestamp": "2026-04-26T09:51:39.163347+00:00",
+  "claude_pane_id": "1BCE348D-D824-444C-9305-FE5E5F18A348",
+  "codex_pane_id": "E5E01E9A-62D4-4BE8-BA6D-C4028A43484A",
+  "claude_label": "claude1",
+  "codex_label": "codex1",
+  "ask_complete_event": null,
+  "phases": [
+    {
+      "name": "spawn_and_boot",
+      "elapsed_ms": 35509
+    },
+    {
+      "name": "prompts_settled",
+      "elapsed_ms": 38535
+    },
+    {
+      "name": "send_prompt",
+      "elapsed_ms": 38789
+    },
+    {
+      "name": "complete_or_timeout",
+      "elapsed_ms": 278930
+    }
+  ],
+  "claude_tail": "   is two plus two? Answer with the  \n  digit only.\" and timeout=120.      \n  After the tool returns, write one  \n  short line summarising the answer  \n  Codex gave you, then on the next   \n  line output exactly:               \n  <<DEMO_DONE_1777196858812>>        \n\u0000\u0000      \u0000        \n \u0000Called teammate (ctrl+o to expand)\n                                     \n⏺ Codex did not respond within the   \n  120s timeout.                   \n  <>                                 \n                                     \n✻ Baked for 2m 12s                   \n                                     \n─────────────────────────────────────\n❯                                    \n─────────────────────────────────────\n  Context: 3% used (97% left)  Opu…  \n\u0000\u0000⏵⏵ bypass permissions on         \n                                     \n",
+  "codex_tail": "│\n│ permissions: YOLO mode\n│\n╰────────────────────────────────────\n─────╯\n\n  Tip: Try the Codex App. Run 'codex\n  app' or visit\n  https://chatgpt.com/codex?app-landi\nng-page=true\n\n \n› [teammate-mcp ASK 1777196864883-\n  1f09c6 from=claude1]\n  What is two plus two? Answer with\n  the digit only.\n \n  When you finish, output exactly\n  this marker on its own line:\n  <<DONE_1777196864883-1f09c6>>\n \n \n  gpt-5.5 default · ~/programming/te…",
+  "status": "timeout"
+}

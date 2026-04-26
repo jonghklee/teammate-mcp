@@ -1,0 +1,36 @@
+{
+  "scenario": "live_round_trip",
+  "timestamp": "2026-04-26T10:00:13.652848+00:00",
+  "claude_pane_id": "2D30BC1E-25C7-45B1-BD59-B3C0A1761081",
+  "codex_pane_id": "DBF25913-17EE-45E5-96A4-1E2B4D942D6C",
+  "claude_label": "claude1",
+  "codex_label": "codex1",
+  "ask_complete_event": {
+    "ts": "2026-04-26T10:00:12.481+00:00",
+    "elapsed_ms": 44762,
+    "event": "ask.complete",
+    "id": "1777197607411-518360",
+    "answer_len": 3
+  },
+  "phases": [
+    {
+      "name": "spawn_and_boot",
+      "elapsed_ms": 35634
+    },
+    {
+      "name": "prompts_settled",
+      "elapsed_ms": 38689
+    },
+    {
+      "name": "send_prompt",
+      "elapsed_ms": 38943
+    },
+    {
+      "name": "complete_or_timeout",
+      "elapsed_ms": 50952
+    }
+  ],
+  "claude_tail": " \u0000▘▘\u0000▝▝\u0000\u0000\u0000\u0000~/…/teammate-mcp\n\n❯ Use mcp__teammate__ask with        \n  target='codex1' and question=\"What \n   is two plus two? Answer with the  \n  digit only.\" and timeout=120.      \n  After the tool returns, write one  \n  short line summarising the answer  \n  Codex gave you, then on the next   \n  line output exactly:               \n  <<DEMO_DONE_1777197601387>>        \n\u0000\u0000      \u0000        \n⏺\u0000Calling teammate… (ctrl+o to \n  expand)                            \n                                     \n· Ideating… (11s · ↑ 273 tokens)\n                                     \n─────────────────────────────────────\n❯                          \n─────────────────────────────────────\n\u0000\u0000Context:\u00003%\u0000used\u0000(97%\u0000left) \u0000Opu…\n\u0000\u0000⏵⏵\u0000bypass\u0000permissions\u0000on \n",
+  "codex_tail": "\n  Tip: New Use /fast to enable our\n  fastest inference with increased\n  plan usage.\n\n\n› [teammate-mcp ASK 1777197607411-\n  518360 from=claude1]\n  What is two plus two? Answer with\n  the digit only.\n\n  When you finish, output exactly\n  this marker on its own line:\n  <<DONE_1777197607411-518360>>\n\n\n• 4\n  <<DONE_1777197607411-518360>>\n\n \n› Explain this codebase\n \n  gpt-5.5 default · ~/programming/te…",
+  "status": "success"
+}

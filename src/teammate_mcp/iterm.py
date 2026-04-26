@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
+import subprocess
 import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -22,6 +24,164 @@ try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - psutil is a runtime dep
     psutil = None  # type: ignore
+
+
+# ===========================================================================
+# OSASCRIPT FALLBACK
+# ---------------------------------------------------------------------------
+# The iterm2 Python lib's `async_get_app(connection)` and per-session
+# variable queries can hang on desktops with many panes. AppleScript via
+# `osascript` is unaffected because it talks to iTerm directly through
+# the Apple Event API, which short-circuits to the requested session by
+# id. We use osascript for send_text + capture in the hot path; the
+# Python API is still used for spawn-time enumeration where it is fine.
+# ===========================================================================
+
+def _applescript_escape(text: str) -> str:
+    """Escape a string for use inside an AppleScript double-quoted string."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def osa_send_text(session_id: str, text: str, submit: bool = True) -> None:
+    """Push ``text`` into the iTerm session whose unique id matches
+    ``session_id``, optionally followed by a real Enter keystroke.
+
+    Pure subprocess — no iterm2 lib. Two-step:
+
+    1. AppleScript ``write text ... newline NO`` — drops the prompt
+       text into the pane buffer. iTerm appears to wrap pasted text
+       in bracketed-paste markers, which means embedded CR/LF stay
+       *inside* the buffer rather than triggering submission.
+    2. ``System Events → key code 36`` — fires an actual Return key
+       event at the OS level, which is delivered outside the bracket
+       paste and therefore commits the line. iTerm is activated and
+       the target session selected just for this keystroke; the user
+       experiences a brief focus blip.
+
+    Multi-line / Unicode prompts go through a tempfile so AppleScript
+    string escaping is sidestepped.
+    """
+    import tempfile
+    body = text.rstrip("\r\n")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                      delete=False, suffix=".tmm") as f:
+        f.write(body)
+        path = f.name
+
+    if submit:
+        script = f'''
+set theText to (read POSIX file "{path}" as «class utf8»)
+tell application "iTerm"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
+                    select s
+                    tell s to write text theText newline NO
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+delay 0.25
+tell application "System Events"
+    key code 36
+end tell
+'''
+    else:
+        script = f'''
+set theText to (read POSIX file "{path}" as «class utf8»)
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
+                    tell s to write text theText newline NO
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+    try:
+        subprocess.run(["osascript", "-e", script], check=True,
+                       capture_output=True, text=True, timeout=15)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def osa_capture(session_id: str) -> str:
+    """Return the visible buffer of an iTerm session via AppleScript.
+
+    Uses iTerm's ``contents`` property which returns the full screen
+    + scrollback as a single string (ANSI stripped by iTerm itself)."""
+    script = f'''
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
+                    return contents of s
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", script],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout
+    except subprocess.CalledProcessError:
+        return ""
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+def osa_session_alive(session_id: str) -> bool:
+    """Return True iff an iTerm session with the given unique id exists."""
+    script = f'''
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
+                    return "yes"
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+return "no"
+'''
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", script],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() == "yes"
+    except Exception:
+        return False
+
+
+async def osa_wait_for_marker(
+    session_id: str, marker: str,
+    timeout: float = 300.0, poll_interval: float = 1.5, min_count: int = 1,
+) -> Optional[str]:
+    """Async wait for ``marker`` in the session screen, ``min_count`` times."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        screen = osa_capture(session_id)
+        if screen and screen.count(marker) >= min_count:
+            return screen
+        await asyncio.sleep(poll_interval)
+    return None
 
 
 # ANSI escape sequence stripper — keeps marker matching robust on

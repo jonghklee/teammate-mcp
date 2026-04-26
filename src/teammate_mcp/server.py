@@ -31,6 +31,10 @@ from .iterm import (
     find_pane,
     find_session_by_job,
     get_screen,
+    osa_capture,
+    osa_send_text,
+    osa_session_alive,
+    osa_wait_for_marker,
     send_text,
     wait_for_marker,
 )
@@ -87,82 +91,115 @@ async def _resolve_target(connection, spec: str, fallback_agent: Optional[str]) 
     return None
 
 
+def _resolve_target_session_id(target: str, fallback_agent: Optional[str]) -> Optional[str]:
+    """Pure-registry, pure-Python target → session_id resolver.
+
+    No iterm2 lib, no AppleScript. Looks up the label in the registry
+    and returns its recorded session_id. For the 1:1 fallback, scans
+    the registry for any entry whose recorded ``job`` matches the
+    requested agent name.
+
+    Used by the new osascript-only ask path; fast and immune to the
+    iterm2 lib's per-pane variable-query stalls.
+    """
+    if target:
+        rec = registry.lookup(target)
+        if rec:
+            sid = (rec.get("session_id") or "").strip()
+            if sid:
+                return sid
+        return None
+    if fallback_agent:
+        wanted = fallback_agent.lower()
+        for rec in registry.all_labels().values():
+            if (rec.get("job") or "").lower() == wanted:
+                sid = (rec.get("session_id") or "").strip()
+                if sid:
+                    return sid
+    return None
+
+
 async def _ask_async(
     question: str,
     timeout: int,
     target: str = "",
     fallback_agent: Optional[str] = None,
 ) -> str:
-    """Drive one ask: enqueue → push → wait → extract → complete."""
+    """Drive one ask: enqueue → push (osascript) → wait (osascript) → return.
+
+    Bypasses the iterm2 Python library entirely on the hot path because
+    `async_get_app(connection)` and per-session variable queries can
+    hang on desktops with many panes. AppleScript via `osascript`
+    addresses the target session by id directly and is unaffected.
+    """
     addressee = target or fallback_agent or "<unspecified>"
     from_agent = os.environ.get("TEAMMATE_LABEL") or fallback_agent or "unknown"
     msg = _queue.enqueue(from_agent, addressee, question, timeout=timeout)
     _log.event(
         "ask.enqueue",
-        id=msg.id,
-        from_=from_agent,
-        to=addressee,
-        target_spec=target or None,
-        len=len(question),
+        id=msg.id, from_=from_agent, to=addressee,
+        target_spec=target or None, len=len(question),
     )
 
-    _log.event("ask.connect_start", id=msg.id)
-    connection = await iterm2.Connection.async_create()
-    _log.event("ask.connect_ok", id=msg.id)
-    try:
-        ref = await _resolve_target(connection, target, fallback_agent)
-        _log.event("ask.resolve",
-                   id=msg.id, found=ref is not None,
-                   resolved_session=(ref.session_id if ref else None))
-        if ref is None:
-            _queue.fail(msg.id, "session not found")
-            _log.event("ask.fail", id=msg.id, reason="session_not_found", target=addressee)
-            if target:
-                return (
-                    f"ERROR: no registered pane matches target {target!r}.\n"
-                    f"Hint: in the target pane, run `/team-register` so it shows up "
-                    f"in mcp__teammate__list_panes()."
-                )
+    sid = _resolve_target_session_id(target, fallback_agent)
+    _log.event("ask.resolve", id=msg.id, found=sid is not None, session_id=sid)
+    if sid is None:
+        _queue.fail(msg.id, "session not found")
+        _log.event("ask.fail", id=msg.id, reason="not_in_registry", target=addressee)
+        if target:
             return (
-                f"ERROR: no registered '{fallback_agent}' pane.\n"
-                f"Hint: in the {fallback_agent} pane, run `/team-register` first."
+                f"ERROR: no registered pane matches target {target!r}.\n"
+                f"Hint: in the target pane, run `teammate-mcp register-pane` "
+                f"(or use the tmclaude/tmcodex wrappers)."
             )
-
-        marker = f"<<DONE_{msg.id}>>"
-        body = (
-            f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
-            f"{question}\n\n"
-            f"When you finish, output exactly this marker on its own line:\n"
-            f"{marker}\n"
+        return (
+            f"ERROR: no registered '{fallback_agent}' pane.\n"
+            f"Hint: in the {fallback_agent} pane, run `teammate-mcp register-pane`."
         )
 
-        # Atomic claim before push so concurrent producers don't double-fire.
-        _queue.claim(msg.id)
-        _log.event("ask.send_start", id=msg.id, to=addressee, session_id=ref.session_id)
-        await send_text(ref, body)
-        _log.event("ask.send", id=msg.id, to=addressee, session_id=ref.session_id)
-
-        # min_count=2: the prompt we just injected contains the marker
-        # text, which gets echoed in the target pane. We must wait for a
-        # *second* occurrence (= the actual reply) to avoid returning
-        # immediately on our own injection.
-        screen = await wait_for_marker(
-            ref, marker, timeout=float(timeout), min_count=2
+    if not osa_session_alive(sid):
+        registry.unregister(addressee if target else "")
+        _queue.fail(msg.id, "session vanished")
+        _log.event("ask.fail", id=msg.id, reason="session_dead", session_id=sid)
+        return (
+            f"ERROR: registered pane {addressee} (session {sid[:8]}…) is no "
+            f"longer open in iTerm. Re-register the new pane."
         )
-        if screen is None:
-            _queue.fail(msg.id, "timeout")
-            _log.event("ask.timeout", id=msg.id, timeout=timeout)
-            return f"TIMEOUT: no '{marker}' within {timeout}s"
 
-        answer = extract_answer(screen, question, marker)
-        _queue.complete(msg.id, answer)
-        _log.event("ask.complete", id=msg.id, answer_len=len(answer))
-        return answer or "(empty answer)"
-    finally:
-        try:
-            connection.close()
-        except Exception:
-            pass
+    marker = f"<<DONE_{msg.id}>>"
+    body = (
+        f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
+        f"{question}\n\n"
+        f"When you finish, output exactly this marker on its own line:\n"
+        f"{marker}\n"
+    )
+
+    _queue.claim(msg.id)
+    _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid)
+    try:
+        # Run the (sync) subprocess send in a thread so we don't block
+        # the asyncio loop.
+        await asyncio.to_thread(osa_send_text, sid, body, True)
+    except Exception as e:
+        _queue.fail(msg.id, f"send_text failed: {e!r}")
+        _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
+        return f"ERROR: send_text via osascript failed: {e}"
+    _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
+
+    # min_count=2: the prompt we injected contains the marker; wait for
+    # the SECOND occurrence (the agent's actual reply terminator).
+    screen = await osa_wait_for_marker(
+        sid, marker, timeout=float(timeout), poll_interval=2.0, min_count=2,
+    )
+    if screen is None:
+        _queue.fail(msg.id, "timeout")
+        _log.event("ask.timeout", id=msg.id, timeout=timeout)
+        return f"TIMEOUT: no '{marker}' within {timeout}s"
+
+    answer = extract_answer(screen, question, marker)
+    _queue.complete(msg.id, answer)
+    _log.event("ask.complete", id=msg.id, answer_len=len(answer))
+    return answer or "(empty answer)"
 
 
 # ---------------------------------------------------------------------------

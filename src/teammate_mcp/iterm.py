@@ -53,6 +53,32 @@ async def _safe_var(session: iterm2.Session, name: str) -> str:
         return ""
 
 
+async def _session_by_id(connection, session_id: str) -> Optional[SessionRef]:
+    """Cheap lookup: walk the iTerm tree for one matching session_id and
+    build only that SessionRef.
+
+    Critical: we deliberately do NOT fetch jobName/commandLine/path here.
+    On desktops with many panes those variable queries can hang (the
+    iterm2 lib blocks waiting for a slow pane to respond). For the
+    routing fast path we only need ``session.async_send_text``, which
+    works on the bare Session object — no variables required."""
+    sid_up = session_id.upper()
+    app = await iterm2.async_get_app(connection)
+    for window in app.windows:
+        for tab in window.tabs:
+            for session in tab.sessions:
+                if session.session_id.upper() == sid_up:
+                    return SessionRef(
+                        session=session,
+                        session_id=session.session_id,
+                        name=session.name or "",
+                        job="",            # not fetched — see docstring
+                        command_line="",   # not fetched
+                        cwd=None,          # not fetched
+                    )
+    return None
+
+
 async def list_sessions(connection) -> list[SessionRef]:
     """Enumerate all live sessions across all windows + tabs."""
     app = await iterm2.async_get_app(connection)
@@ -83,7 +109,9 @@ async def find_pane(connection, target: str) -> Optional[SessionRef]:
     """Locate a pane by label OR session name OR session-id prefix.
 
     Resolution order:
-        1. registered label (``TEAMMATE_LABEL``)
+        1. registered label (fast path — looks up session_id directly,
+           avoids the expensive enumeration of every iTerm session on
+           the user's desktop)
         2. iTerm session name (case-insensitive, exact match)
         3. session_id prefix (≥ 6 chars, case-insensitive)
         4. session name substring (last-resort fuzzy match)
@@ -92,15 +120,18 @@ async def find_pane(connection, target: str) -> Optional[SessionRef]:
         return None
     needle = target.strip()
 
-    refs = await list_sessions(connection)
-    by_id = {r.session_id.upper(): r for r in refs}
-
-    # 1. label
+    # 1. Fast path: registered label → resolve directly via session_id.
     rec = _registry.lookup(needle)
     if rec:
-        sid = (rec.get("session_id") or "").upper()
-        if sid in by_id:
-            return by_id[sid]
+        sid = (rec.get("session_id") or "").strip()
+        if sid:
+            ref = await _session_by_id(connection, sid)
+            if ref is not None:
+                return ref
+
+    # Slow path: enumerate every session to fuzzy-match.
+    refs = await list_sessions(connection)
+    by_id = {r.session_id.upper(): r for r in refs}
 
     # 2. session name exact (case-insensitive)
     for r in refs:

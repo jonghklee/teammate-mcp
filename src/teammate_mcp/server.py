@@ -58,21 +58,32 @@ _queue = MessageQueue(mode=QUEUE_MODE)
 
 
 async def _resolve_target(connection, spec: str, fallback_agent: Optional[str]) -> Optional[SessionRef]:
-    """Resolve a target spec to an iTerm session.
+    """Resolve a target spec to an iTerm session — REGISTRY ONLY.
 
-    ``spec`` may be a label, session name, or session-id prefix (handled by
-    ``find_pane``). When ``spec`` is empty *and* ``fallback_agent`` is set,
-    fall back to the legacy 1:1 jobName lookup so existing
-    ``ask_codex``/``ask_claude`` callers still work.
+    Behavior change in v0.3.0: we no longer fall back to scanning the
+    process table for any matching jobName. Only panes the user has
+    explicitly registered (via ``/team-register`` or ``register_self``)
+    are addressable. This matches the user's mental model: "only tagged
+    panes participate".
+
+    For ``spec``: try ``find_pane`` (label / session name / id prefix).
+    For ``fallback_agent``: look up the registry for any registered pane
+    whose recorded ``job`` matches the agent name. Returns None if no
+    registered pane matches.
     """
     if spec:
-        ref = await find_pane(connection, spec)
-        if ref is not None:
-            return ref
+        return await find_pane(connection, spec)
+
     if fallback_agent:
-        return await find_session_by_job(
-            connection, _jobname_for(fallback_agent), prefer_cwd=PROJECT_CWD
-        )
+        wanted = fallback_agent.lower()
+        from .iterm import list_sessions
+        live_sids = {r.session_id.upper() for r in await list_sessions(connection)}
+        for label, rec in registry.all_labels().items():
+            if (rec.get("job") or "").lower() != wanted:
+                continue
+            sid = (rec.get("session_id") or "").upper()
+            if sid in live_sids:
+                return await find_pane(connection, label)
     return None
 
 
@@ -102,8 +113,15 @@ async def _ask_async(
             _queue.fail(msg.id, "session not found")
             _log.event("ask.fail", id=msg.id, reason="session_not_found", target=addressee)
             if target:
-                return f"ERROR: no iTerm pane matches target {target!r} (try mcp__teammate__list_panes)"
-            return f"ERROR: no iTerm pane is currently running '{_jobname_for(fallback_agent or '')}'"
+                return (
+                    f"ERROR: no registered pane matches target {target!r}.\n"
+                    f"Hint: in the target pane, run `/team-register` so it shows up "
+                    f"in mcp__teammate__list_panes()."
+                )
+            return (
+                f"ERROR: no registered '{fallback_agent}' pane.\n"
+                f"Hint: in the {fallback_agent} pane, run `/team-register` first."
+            )
 
         marker = f"<<DONE_{msg.id}>>"
         body = (
@@ -206,12 +224,17 @@ async def list_panes() -> list[dict]:
 
 
 @mcp.tool()
-async def register_self(label: str) -> str:
-    """Register the *calling* pane under ``label``.
+async def register_self(label: str = "") -> str:
+    """Register the *calling* pane.
 
-    Looks up the calling process's iTerm session via its
-    ``TERM_SESSION_ID`` env var. Subsequent ``ask(target=label, …)``
-    calls will route to this pane.
+    If ``label`` is empty (the default), an auto label is assigned:
+    ``claude1`` / ``codex1`` / ``codex2`` / etc., based on the pane's
+    job and the next free slot. Subsequent ``ask(target=label, …)``
+    calls route to this pane.
+
+    The returned string includes the chosen label so the caller can
+    print it back to the user — they should *also* set their iTerm
+    tab title to that label so it's visible at the bottom of the pane.
     """
     tsid = os.environ.get("TERM_SESSION_ID", "")
     sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
@@ -229,16 +252,37 @@ async def register_self(label: str) -> str:
                 break
         if match is None:
             return f"ERROR: could not find iTerm session {sid_tail}"
+
+        # Reuse existing label if this pane is already registered.
+        existing_label = next(
+            (l for l, r in registry.all_labels().items()
+             if (r.get("session_id") or "").upper() == match.session_id.upper()),
+            None,
+        )
+        chosen = label.strip() or existing_label or _next_auto_label(match.job, match.name or "")
+
         registry.register(
-            label=label,
+            label=chosen,
             session_id=match.session_id,
             pid=os.getpid(),
             job=match.job,
             cwd=match.cwd,
-            extra={"session_name": match.name or None},
+            extra={"session_name": match.name or None,
+                   "auto_assigned": not label.strip()},
         )
-        _log.event("register", label=label, session_id=match.session_id)
-        return f"registered {match.session_id} as {label!r}"
+
+        # Try to set the iTerm tab title so the label is visible to the
+        # user without requiring `bin/install-statusline`.
+        try:
+            await match.session.async_send_text(
+                f"\x1b]2;[{chosen}]\x07"
+            )
+        except Exception:
+            pass
+
+        _log.event("register_self", label=chosen, session_id=match.session_id,
+                   auto=not label.strip())
+        return f"registered as '{chosen}' (session {match.session_id[:8]}…)"
     finally:
         try:
             connection.close()

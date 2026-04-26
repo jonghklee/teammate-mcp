@@ -1,0 +1,116 @@
+[
+  {
+    "case": "baseline-A",
+    "left_cwd": "/Users/siheom-yong/programming/teammate-mcp",
+    "right_cwd": "/Users/siheom-yong/programming/teammate-mcp",
+    "claude_pane_id": "7C384023-923E-4F32-B666-E081B1C8B461",
+    "codex_pane_id": "4DD61C09-6377-4A94-9106-2387C3B174EA",
+    "claude_label": "agent1",
+    "codex_label": "codex1",
+    "registry_keys": [
+      "agent1",
+      "agent2",
+      "codex1"
+    ],
+    "ask_complete_event": null,
+    "marker_seen_in_claude_pane": false,
+    "phases": [
+      {
+        "name": "spawn_and_boot",
+        "elapsed_ms": 25975
+      },
+      {
+        "name": "prompts_settled",
+        "elapsed_ms": 31494
+      },
+      {
+        "name": "send_prompt",
+        "elapsed_ms": 31838
+      },
+      {
+        "name": "round_trip",
+        "elapsed_ms": 272207
+      }
+    ],
+    "status": "timeout"
+  },
+  {
+    "case": "cross-dir",
+    "left_cwd": "/tmp",
+    "right_cwd": "/Users/siheom-yong/programming/teammate-mcp",
+    "claude_pane_id": "7590D598-E20A-4344-80A6-2BD977252314",
+    "codex_pane_id": "9F8553E1-FA80-47D0-AA5B-8BFC10C7D082",
+    "claude_label": "agent3",
+    "codex_label": "codex2",
+    "registry_keys": [
+      "agent1",
+      "agent2",
+      "agent3",
+      "agent4",
+      "codex1",
+      "codex2"
+    ],
+    "ask_complete_event": null,
+    "marker_seen_in_claude_pane": false,
+    "phases": [
+      {
+        "name": "spawn_and_boot",
+        "elapsed_ms": 26063
+      },
+      {
+        "name": "prompts_settled",
+        "elapsed_ms": 29189
+      },
+      {
+        "name": "send_prompt",
+        "elapsed_ms": 29546
+      },
+      {
+        "name": "round_trip",
+        "elapsed_ms": 269826
+      }
+    ],
+    "status": "timeout"
+  },
+  {
+    "case": "baseline-B",
+    "left_cwd": "/Users/siheom-yong/programming/teammate-mcp",
+    "right_cwd": "/Users/siheom-yong/programming/teammate-mcp",
+    "claude_pane_id": "82281FFD-665E-437A-B316-231453D92312",
+    "codex_pane_id": "07019892-1B5B-42EC-ABAC-A7B9FBB5B691",
+    "claude_label": "claude1",
+    "codex_label": "codex3",
+    "registry_keys": [
+      "agent1",
+      "agent2",
+      "agent3",
+      "agent4",
+      "agent5",
+      "claude1",
+      "codex1",
+      "codex2",
+      "codex3"
+    ],
+    "ask_complete_event": null,
+    "marker_seen_in_claude_pane": false,
+    "phases": [
+      {
+        "name": "spawn_and_boot",
+        "elapsed_ms": 26307
+      },
+      {
+        "name": "prompts_settled",
+        "elapsed_ms": 29477
+      },
+      {
+        "name": "send_prompt",
+        "elapsed_ms": 29942
+      },
+      {
+        "name": "round_trip",
+        "elapsed_ms": 271694
+      }
+    ],
+    "status": "timeout"
+  }
+]

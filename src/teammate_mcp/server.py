@@ -292,15 +292,86 @@ def queue_status() -> dict:
     return _queue.status()
 
 
-def _auto_register_from_env() -> None:
-    """If the caller exported TEAMMATE_LABEL, attach it to this pane.
+async def auto_register_session(connection, session_id: str,
+                                 explicit_label: Optional[str] = None) -> Optional[dict]:
+    """Register an iTerm pane (by id) into the global registry.
 
-    Runs once at server startup; failures are non-fatal (e.g. iTerm
-    Python API not enabled in CI).
+    Used by spawn helpers (`bin/team`, demo scripts) so a pane is
+    addressable *immediately* after launch — before its CLI gets a chance
+    to invoke any MCP tool. Returns the registered record or None on miss.
+
+    If the pane is already registered (same session_id), reuses the
+    existing label instead of inventing a new one — prevents the
+    ``agent1`` and ``agent2`` both pointing at the same pane.
     """
-    label = os.environ.get("TEAMMATE_LABEL")
-    if not label:
-        return
+    from .iterm import list_sessions
+    refs = await list_sessions(connection)
+    sid_up = session_id.upper()
+    me = next((r for r in refs if r.session_id.upper() == sid_up), None)
+    if me is None:
+        return None
+
+    # Reuse existing label if this pane is already registered.
+    existing_label: Optional[str] = None
+    for label, rec in registry.all_labels().items():
+        if (rec.get("session_id") or "").upper() == sid_up:
+            existing_label = label
+            break
+
+    label = explicit_label or existing_label or _next_auto_label(me.job, me.name)
+    registry.register(
+        label=label,
+        session_id=me.session_id,
+        pid=os.getpid(),
+        job=me.job,
+        cwd=me.cwd,
+        extra={"session_name": me.name or None,
+               "auto_assigned": not explicit_label},
+    )
+    return {
+        "label": label,
+        "session_id": me.session_id,
+        "job": me.job,
+        "cwd": me.cwd,
+    }
+
+
+def _classify(job: str, session_name: str = "") -> str:
+    """Decide the label prefix from job + session_name hints.
+
+    Claude Code reports its jobName as 'Python' or 'claude.exe' depending
+    on platform, but its session_name typically contains 'Claude Code'.
+    Codex is more honest and reports 'codex'. We check both fields.
+    """
+    haystack = f"{job or ''} {session_name or ''}".lower()
+    if "claude" in haystack:
+        return "claude"
+    if "codex" in haystack:
+        return "codex"
+    return "agent"
+
+
+def _next_auto_label(job: str, session_name: str = "") -> str:
+    """Pick the next free ``{base}{n}`` label."""
+    base = _classify(job, session_name)
+    used = set(registry.all_labels().keys())
+    n = 1
+    while f"{base}{n}" in used:
+        n += 1
+    return f"{base}{n}"
+
+
+def _auto_register_from_env() -> None:
+    """Attach a label to the calling pane on server startup.
+
+    Order:
+      1. If ``TEAMMATE_LABEL`` is exported, use it verbatim.
+      2. Otherwise auto-assign the next free ``{job}{n}`` slot
+         (``claude1``, ``codex1``, ``codex2`` …).
+
+    Non-fatal: if iTerm's Python API isn't reachable we silently skip.
+    """
+    explicit = os.environ.get("TEAMMATE_LABEL", "").strip()
     tsid = os.environ.get("TERM_SESSION_ID", "")
     sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
     if not sid_tail:
@@ -314,18 +385,34 @@ def _auto_register_from_env() -> None:
         try:
             from .iterm import list_sessions
             refs = await list_sessions(connection)
+            me = None
             for r in refs:
                 if r.session_id.upper().endswith(sid_tail.upper()):
-                    registry.register(
-                        label=label,
-                        session_id=r.session_id,
-                        pid=os.getpid(),
-                        job=r.job,
-                        cwd=r.cwd,
-                        extra={"session_name": r.name or None},
-                    )
-                    _log.event("auto_register", label=label, session_id=r.session_id)
+                    me = r
                     break
+            if me is None:
+                return
+            # Reuse an existing label for this pane if there is one.
+            existing_label = next(
+                (l for l, r in registry.all_labels().items()
+                 if (r.get("session_id") or "").upper() == me.session_id.upper()),
+                None,
+            )
+            label = explicit or existing_label or _next_auto_label(me.job, me.name or "")
+            registry.register(
+                label=label,
+                session_id=me.session_id,
+                pid=os.getpid(),
+                job=me.job,
+                cwd=me.cwd,
+                extra={"session_name": me.name or None,
+                       "auto_assigned": not explicit},
+            )
+            # Make the chosen label visible to the *current* server
+            # process — used as `from_agent` in queue records.
+            os.environ["TEAMMATE_LABEL"] = label
+            _log.event("auto_register", label=label,
+                       session_id=me.session_id, auto=not explicit)
         finally:
             try:
                 connection.close()
@@ -335,7 +422,6 @@ def _auto_register_from_env() -> None:
     try:
         asyncio.get_event_loop().run_until_complete(_go())
     except RuntimeError:
-        # No running loop yet — start one just for this.
         asyncio.run(_go())
     except Exception:
         pass

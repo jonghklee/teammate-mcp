@@ -157,6 +157,46 @@ def _cmd_unregister(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_statusline() -> int:
+    """Print this pane's teammate label for Claude Code's statusLine.
+
+    Looks up the calling shell's TERM_SESSION_ID in the registry and
+    emits a one-line summary. Claude Code reads stdin (a JSON blob with
+    cwd/model/etc) on every turn and renders our stdout under the
+    prompt. We ignore stdin and print whatever's most useful.
+    """
+    import json as _json
+    # Drain stdin — Claude Code feeds us context; we don't need it here.
+    try:
+        if not sys.stdin.isatty():
+            sys.stdin.read()
+    except Exception:
+        pass
+
+    from . import registry
+    tsid = os.environ.get("TERM_SESSION_ID", "")
+    sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    sid_up = sid_tail.upper() if sid_tail else ""
+
+    label = None
+    if sid_up:
+        for lbl, rec in registry.all_labels().items():
+            rec_sid = (rec.get("session_id") or "").upper()
+            if rec_sid == sid_up or rec_sid.endswith(sid_up):
+                label = lbl
+                break
+
+    # All currently registered labels (sorted) for context.
+    others = sorted(registry.all_labels().keys())
+    others_str = " ".join(others) if others else "(none)"
+
+    if label:
+        print(f"🟢 {label}  │ team: {others_str}")
+    else:
+        print(f"⚪ unregistered  │ team: {others_str}  │ run /team-register")
+    return 0
+
+
 def main():
     if len(sys.argv) <= 1 or sys.argv[1] == "serve":
         serve_main()
@@ -181,6 +221,8 @@ def main():
         sys.exit(_cmd_list())
     if cmd == "unregister":
         sys.exit(_cmd_unregister(rest))
+    if cmd == "statusline":
+        sys.exit(_cmd_statusline())
 
     print(f"unknown subcommand: {cmd!r}", file=sys.stderr)
     print(HELP, file=sys.stderr)

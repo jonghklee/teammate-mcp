@@ -114,11 +114,29 @@ def _cmd_register_pane(argv: list[str]) -> int:
             )
             spawn_track.record(me.session_id, spawned_by=f"cli register-pane (pid {os.getpid()})")
 
-            # Set the iTerm tab title so the label is visible immediately.
+            # Make the label visible to the user via three iTerm channels:
+            #   1. tab title (top of window)             ESC ] 2 ; … BEL
+            #   2. iTerm badge (large overlay in pane)   ESC ] 1337 ; SetBadgeFormat=<b64> BEL
+            #   3. our own stdout (shell prints them)    same escape sequences
+            # The badge is the most visible indicator on Codex panes,
+            # which lack a Claude-Code-style status line.
+            import base64 as _b64
+            badge_b64 = _b64.b64encode(label.encode()).decode()
+            tab_esc   = f"\x1b]2;[{label}]\x07"
+            badge_esc = f"\x1b]1337;SetBadgeFormat={badge_b64}\x07"
+
+            # Channel A — push via iTerm Python API to the matched session.
             try:
-                await me.session.async_send_text(f"\x1b]2;[{label}]\x07")
+                await me.session.async_send_text(tab_esc + badge_esc)
             except Exception:
                 pass
+
+            # Channel B — write to our own stdout. Because register-pane
+            # runs in the same shell as the upcoming claude/codex, these
+            # escapes are processed by the *same* iTerm session before
+            # the CLI takes over the screen.
+            sys.stdout.write(tab_esc)
+            sys.stdout.write(badge_esc)
 
             print(f"✓ registered as {label}  (session {me.session_id[:8]}…, "
                   f"job={me.job!r}, cwd={me.cwd})")

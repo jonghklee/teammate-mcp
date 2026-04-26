@@ -1,15 +1,12 @@
 ---
-description: "Register THIS pane in teammate-mcp under an auto-assigned label (claude1, codex1, codex2, ...)."
+description: "Register THIS pane in teammate-mcp via the CLI (no MCP round-trip)."
 ---
 
-Call `mcp__teammate__register_self` with no `label` argument (empty
-string). The server picks the next free `claude1` / `codex1` / ...
-slot based on this pane's job and returns the chosen label.
+Run this exact bash command and print its output verbatim:
 
-Reply with one short line containing the returned label, e.g.:
-
-```
-✓ registered as claude1
+```bash
+/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp register-pane
 ```
 
-Then end the turn. Do not call any other tool.
+The CLI prints `✓ registered as <label> (...)`. Echo that line to the
+user, then end the turn. Do not call any MCP tool.

@@ -1,6 +1,11 @@
 ---
-description: "List every iTerm pane currently registered with teammate-mcp."
+description: "List every iTerm pane currently registered with teammate-mcp (CLI)."
 ---
 
-Call `mcp__teammate__list_panes` with no arguments and print the
-result as a small table or bullet list. Then end the turn.
+Run this exact bash command and print its output verbatim:
+
+```bash
+/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp list
+```
+
+Then end the turn.

@@ -1,10 +1,11 @@
 ---
-description: "Register THIS Claude pane under an auto-assigned label (claude1, claude2, ...)."
+description: "Register THIS Claude pane via the CLI."
 ---
 
-Call `mcp__teammate__register_self` with no `label` argument. The
-server auto-assigns `claude1` / `claude2` / ... based on this pane's
-job and returns the chosen label.
+Run this exact bash command and print its output verbatim:
 
-Reply with one short line: `✓ registered as <label>`. Then end the
-turn. Do not call any other tool.
+```bash
+/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp register-pane
+```
+
+Then end the turn. Do not call any MCP tool.

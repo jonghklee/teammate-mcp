@@ -79,6 +79,12 @@ end tell
         raise RuntimeError(f"unexpected osascript output: {out!r}")
     left_id, right_id = parts
 
+    # Record ids in the spawn ledger so cleanup_my_panes.py can find them
+    # later — and so cleanup never confuses them with sibling user panes.
+    from teammate_mcp import spawn_track
+    spawn_track.record(left_id, spawned_by="scripts/auto_demo.py")
+    spawn_track.record(right_id, spawned_by="scripts/auto_demo.py")
+
     # Step 2: now that we know the ids, ask AppleScript to type the
     # `cd + export + launch` sequence into each pane.
     osa_step2 = f'''
@@ -153,10 +159,11 @@ async def main() -> int:
     record["claude_pane_id"] = claude_id
     record["codex_pane_id"] = codex_id
 
-    # Give the CLIs time to boot. claude+codex are heavyweight and need
-    # a few seconds to initialise their prompts.
-    print("[demo] waiting 25s for both CLIs to boot")
-    await asyncio.sleep(25.0)
+    # Give the CLIs time to boot. claude+codex are heavyweight; at 25s
+    # codex sometimes isn't ready to accept its first `\r`-submitted
+    # prompt, so the demo silently times out.
+    print("[demo] waiting 30s for both CLIs to boot")
+    await asyncio.sleep(30.0)
     timings.append(("spawn_and_boot", int((time.monotonic() - t0) * 1000)))
 
     print("[demo] connecting to iTerm Python API")

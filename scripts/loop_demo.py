@@ -63,6 +63,10 @@ end tell
     out = subprocess.check_output(["osascript", "-e", osa1], text=True).strip()
     left_id, right_id = out.split("|")
 
+    from teammate_mcp import spawn_track
+    spawn_track.record(left_id, spawned_by="scripts/loop_demo.py")
+    spawn_track.record(right_id, spawned_by="scripts/loop_demo.py")
+
     osa2 = f'''
 tell application "iTerm"
     repeat with w in windows
@@ -139,8 +143,10 @@ async def run_one_case(case: dict) -> dict:
     left_id, right_id = spawn_window(left_cwd, right_cwd)
     print(f"  panes spawned: claude={left_id[:8]}…  codex={right_id[:8]}…")
 
-    print("  waiting 25s for CLIs to boot")
-    await asyncio.sleep(25.0)
+    # 30s minimum — at 25s codex isn't always ready to accept the first
+    # `\r`-submitted prompt, so the round-trip silently times out.
+    print("  waiting 30s for CLIs to boot")
+    await asyncio.sleep(30.0)
     timings.append(("spawn_and_boot", int((time.monotonic() - t0) * 1000)))
 
     connection = await iterm2.Connection.async_create()

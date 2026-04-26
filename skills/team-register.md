@@ -1,40 +1,47 @@
 ---
 name: team-register
-description: "Register the current iTerm pane with teammate-mcp under an auto-assigned label like claude1 or codex1. Use when the user types /team-register or asks to tag/register this pane."
+description: "Register THIS iTerm pane in teammate-mcp under an auto-assigned label (claude1, codex1, codex2, ...). Trigger this on /tmclaude, /tmcodex, /tm, /register, /team-register, or when the user says to tag/register this pane in Korean or English."
 ---
 
 # team-register
 
-Register *this* iTerm pane with the `teammate-mcp` server so sibling
-panes can address it by label.
+The user wants this pane to be addressable by sibling panes through
+the teammate-mcp bridge. Run the registration once.
 
-## What to do
+## Action — exactly these steps, nothing else
 
-1. Call `mcp__teammate__register_self` with no `label` argument (or
-   an empty string). The server auto-assigns the next free
-   `{job}{n}` slot — `claude1` if you are Claude, `codex1`/`codex2`/...
-   if you are Codex. The server returns the label it chose.
+1. Call `mcp__teammate__register_self` with **no arguments** (label = "").
+   The server picks the next free `claude1` / `codex1` / `codex2` / ...
+   based on the calling pane's job. The server returns the chosen label.
 
-2. Echo the returned label back to the user in one short line, e.g.:
+2. Reply with **one short line** containing the returned label, e.g.:
 
    ```
    ✓ registered as claude1
    ```
 
-3. End the turn. Do not call any other tool.
+3. **End the turn. Do not call any other tool.**
 
-## Notes
+If the user supplied an explicit label (e.g. "register me as worker"),
+pass it as the `label` argument; otherwise leave it empty.
 
-- The server also writes an iTerm tab-title escape sequence so the
-  chosen label shows up on the pane's tab/title bar automatically.
-- If the user provides an explicit label, pass it as the `label`
-  argument instead of an empty string.
-- Re-running this on an already-registered pane is safe: the existing
-  label is reused, not duplicated.
+Re-running on an already-registered pane is safe — the existing label
+is reused.
 
 ## Trigger phrases
 
+The user may invoke this skill via any of:
+
+- `/tmclaude` (when running Claude — registers this Claude pane)
+- `/tmcodex`  (when running Codex — registers this Codex pane)
+- `/tm`
+- `/register`
 - `/team-register`
-- 이 페인 등록해줘 / 이 페인 태그해줘
-- register this pane / tag this pane
-- register me as <name> — pass the name as the label
+- "이 페인 등록해줘"
+- "이 페인 태그해줘"
+- "register this pane"
+- "tag this pane"
+- "register me as <name>"  → pass <name> as the label
+
+Treat all of the above the same: a single `register_self` call followed
+by a one-line confirmation.

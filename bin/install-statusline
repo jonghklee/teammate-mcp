@@ -1,0 +1,84 @@
+#!/usr/bin/env zsh
+# install-statusline — wire pane labels into Claude Code's status line
+# (native feature) and into iTerm's tab title (used by both Claude and
+# Codex panes since Codex has no built-in status line API).
+#
+# Idempotent: re-running is safe.
+#
+# What it changes:
+#   1. ~/.claude/settings.json     — adds a `statusLine` block that prints
+#                                    the current pane's TEAMMATE_LABEL.
+#   2. ~/.zshrc                    — appends a precmd hook that updates
+#                                    the iTerm tab title from $TEAMMATE_LABEL.
+
+set -euo pipefail
+
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+ZSHRC="$HOME/.zshrc"
+
+# ---- Claude Code statusLine ------------------------------------------------
+if [[ -f "$CLAUDE_SETTINGS" ]]; then
+    if grep -q '"statusLine"' "$CLAUDE_SETTINGS"; then
+        echo "skip: statusLine already present in $CLAUDE_SETTINGS"
+    else
+        cp "$CLAUDE_SETTINGS" "${CLAUDE_SETTINGS}.bak.$(date +%s)"
+        # Insert statusLine using python so we don't break unrelated keys.
+        python3 - "$CLAUDE_SETTINGS" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+data.setdefault("statusLine", {})
+data["statusLine"] = {
+    "type": "command",
+    "command": (
+        "label=\"${TEAMMATE_LABEL:-}\"; "
+        "[[ -n \"$label\" ]] && printf '\\033[36m[%s]\\033[0m ' \"$label\"; "
+        "printf '%s' \"$(date +%H:%M)\""
+    ),
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+        echo "ok: statusLine added to $CLAUDE_SETTINGS (backup made)"
+    fi
+else
+    cat > "$CLAUDE_SETTINGS" <<'JSON'
+{
+  "statusLine": {
+    "type": "command",
+    "command": "label=\"${TEAMMATE_LABEL:-}\"; [[ -n \"$label\" ]] && printf '\\033[36m[%s]\\033[0m ' \"$label\"; printf '%s' \"$(date +%H:%M)\""
+  }
+}
+JSON
+    echo "ok: created $CLAUDE_SETTINGS with statusLine"
+fi
+
+# ---- zsh hook for iTerm tab title -----------------------------------------
+MARKER="# >>> teammate-mcp tab title hook"
+if grep -qF "$MARKER" "$ZSHRC" 2>/dev/null; then
+    echo "skip: tab title hook already present in $ZSHRC"
+else
+    cat >> "$ZSHRC" <<'ZSH'
+
+# >>> teammate-mcp tab title hook
+# Sets the iTerm tab title to $TEAMMATE_LABEL whenever a prompt renders.
+# (Codex has no native statusLine; this gives the same visual cue.)
+_teammate_set_title() {
+    [[ -n "${TEAMMATE_LABEL:-}" ]] && printf '\033]2;%s\007' "$TEAMMATE_LABEL"
+}
+typeset -a precmd_functions
+precmd_functions+=(_teammate_set_title)
+# <<< teammate-mcp tab title hook
+ZSH
+    echo "ok: appended tab title hook to $ZSHRC"
+fi
+
+echo
+echo "Done. Open a new shell, then in any pane:"
+echo
+echo "    export TEAMMATE_LABEL=worker"
+echo "    claude    # or codex"
+echo
+echo "The Claude statusLine and the iTerm tab title will both show the label."

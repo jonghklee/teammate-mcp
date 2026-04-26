@@ -16,6 +16,8 @@ from typing import Iterable, Optional
 
 import iterm2
 
+from . import registry as _registry
+
 try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - psutil is a runtime dep
@@ -68,6 +70,80 @@ async def list_sessions(connection) -> list[SessionRef]:
                         cwd=(await _safe_var(session, "path")) or None,
                     )
                 )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-criteria pane lookup. ``target`` may be a label (registered via the
+# TEAMMATE_LABEL env var or the register_self tool), an iTerm session name
+# (the one users edit with ``cmd+I``), or any prefix of a session UUID.
+# ---------------------------------------------------------------------------
+
+async def find_pane(connection, target: str) -> Optional[SessionRef]:
+    """Locate a pane by label OR session name OR session-id prefix.
+
+    Resolution order:
+        1. registered label (``TEAMMATE_LABEL``)
+        2. iTerm session name (case-insensitive, exact match)
+        3. session_id prefix (≥ 6 chars, case-insensitive)
+        4. session name substring (last-resort fuzzy match)
+    """
+    if not target:
+        return None
+    needle = target.strip()
+
+    refs = await list_sessions(connection)
+    by_id = {r.session_id.upper(): r for r in refs}
+
+    # 1. label
+    rec = _registry.lookup(needle)
+    if rec:
+        sid = (rec.get("session_id") or "").upper()
+        if sid in by_id:
+            return by_id[sid]
+
+    # 2. session name exact (case-insensitive)
+    for r in refs:
+        if r.name and r.name.lower() == needle.lower():
+            return r
+
+    # 3. session_id prefix / suffix
+    needle_up = needle.upper()
+    if len(needle_up) >= 6:
+        for r in refs:
+            sid = r.session_id.upper()
+            if sid.startswith(needle_up) or sid.endswith(needle_up) or needle_up in sid:
+                return r
+
+    # 4. session name substring (case-insensitive)
+    for r in refs:
+        if r.name and needle.lower() in r.name.lower():
+            return r
+
+    return None
+
+
+async def describe_panes(connection) -> list[dict]:
+    """Return all live panes plus their associated label (if any) and the
+    full set of identifiers a caller can use to address them."""
+    refs = await list_sessions(connection)
+    label_by_sid: dict[str, str] = {}
+    for label, rec in _registry.all_labels().items():
+        sid = (rec.get("session_id") or "").upper()
+        if sid:
+            label_by_sid[sid] = label
+
+    out = []
+    for r in refs:
+        out.append(
+            {
+                "label": label_by_sid.get(r.session_id.upper()),
+                "session_name": r.name or None,
+                "session_id": r.session_id,
+                "job": r.job,
+                "cwd": r.cwd,
+            }
+        )
     return out
 
 

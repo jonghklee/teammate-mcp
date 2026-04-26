@@ -19,14 +19,16 @@ import os
 import re
 import time
 import uuid
-from typing import Optional
+from typing import List, Optional
 
 import iterm2
 from mcp.server.fastmcp import FastMCP
 
 from .iterm import (
     SessionRef,
+    describe_panes,
     extract_answer,
+    find_pane,
     find_session_by_job,
     get_screen,
     send_text,
@@ -34,6 +36,7 @@ from .iterm import (
 )
 from .log import get_logger
 from .queue import MessageQueue
+from . import registry
 
 
 # Configurable through env so users can flip audit mode without code edits.
@@ -54,23 +57,53 @@ _log = get_logger()
 _queue = MessageQueue(mode=QUEUE_MODE)
 
 
-async def _ask_async(target_agent: str, question: str, timeout: int) -> str:
+async def _resolve_target(connection, spec: str, fallback_agent: Optional[str]) -> Optional[SessionRef]:
+    """Resolve a target spec to an iTerm session.
+
+    ``spec`` may be a label, session name, or session-id prefix (handled by
+    ``find_pane``). When ``spec`` is empty *and* ``fallback_agent`` is set,
+    fall back to the legacy 1:1 jobName lookup so existing
+    ``ask_codex``/``ask_claude`` callers still work.
+    """
+    if spec:
+        ref = await find_pane(connection, spec)
+        if ref is not None:
+            return ref
+    if fallback_agent:
+        return await find_session_by_job(
+            connection, _jobname_for(fallback_agent), prefer_cwd=PROJECT_CWD
+        )
+    return None
+
+
+async def _ask_async(
+    question: str,
+    timeout: int,
+    target: str = "",
+    fallback_agent: Optional[str] = None,
+) -> str:
     """Drive one ask: enqueue → push → wait → extract → complete."""
-    from_agent = "claude" if target_agent == "codex" else "codex"
-    msg = _queue.enqueue(from_agent, target_agent, question, timeout=timeout)
-    _log.event("ask.enqueue", id=msg.id, from_=from_agent, to=target_agent, len=len(question))
+    addressee = target or fallback_agent or "<unspecified>"
+    from_agent = os.environ.get("TEAMMATE_LABEL") or fallback_agent or "unknown"
+    msg = _queue.enqueue(from_agent, addressee, question, timeout=timeout)
+    _log.event(
+        "ask.enqueue",
+        id=msg.id,
+        from_=from_agent,
+        to=addressee,
+        target_spec=target or None,
+        len=len(question),
+    )
 
     connection = await iterm2.Connection.async_create()
     try:
-        target = await find_session_by_job(
-            connection,
-            _jobname_for(target_agent),
-            prefer_cwd=PROJECT_CWD,
-        )
-        if target is None:
+        ref = await _resolve_target(connection, target, fallback_agent)
+        if ref is None:
             _queue.fail(msg.id, "session not found")
-            _log.event("ask.fail", id=msg.id, reason="session_not_found")
-            return f"ERROR: no iTerm pane is currently running '{_jobname_for(target_agent)}'"
+            _log.event("ask.fail", id=msg.id, reason="session_not_found", target=addressee)
+            if target:
+                return f"ERROR: no iTerm pane matches target {target!r} (try mcp__teammate__list_panes)"
+            return f"ERROR: no iTerm pane is currently running '{_jobname_for(fallback_agent or '')}'"
 
         marker = f"<<DONE_{msg.id}>>"
         body = (
@@ -82,15 +115,15 @@ async def _ask_async(target_agent: str, question: str, timeout: int) -> str:
 
         # Atomic claim before push so concurrent producers don't double-fire.
         _queue.claim(msg.id)
-        await send_text(target, body)
-        _log.event("ask.send", id=msg.id, to=target_agent, session_id=target.session_id)
+        await send_text(ref, body)
+        _log.event("ask.send", id=msg.id, to=addressee, session_id=ref.session_id)
 
         # min_count=2: the prompt we just injected contains the marker
         # text, which gets echoed in the target pane. We must wait for a
         # *second* occurrence (= the actual reply) to avoid returning
         # immediately on our own injection.
         screen = await wait_for_marker(
-            target, marker, timeout=float(timeout), min_count=2
+            ref, marker, timeout=float(timeout), min_count=2
         )
         if screen is None:
             _queue.fail(msg.id, "timeout")
@@ -113,40 +146,139 @@ async def _ask_async(target_agent: str, question: str, timeout: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def ask_codex(question: str, timeout: int = 300) -> str:
-    """Ask the Codex pane a question and return its answer.
+async def ask(question: str, target: str = "", timeout: int = 300) -> str:
+    """Ask another pane a question and return its answer.
 
-    Use this from Claude when you want Codex's opinion, a code review,
-    or to delegate execution to it.
+    ``target`` may be:
+      * a registered label (set via ``TEAMMATE_LABEL`` env or
+        ``register_self``),
+      * an iTerm session name (the title users edit with ``cmd+I``,
+        case-insensitive exact match),
+      * a session UUID prefix (≥ 6 chars).
+
+    When ``target`` is empty the caller's job name is used: a Claude
+    caller falls back to "codex" and vice versa, preserving the v0.1
+    1:1 default behaviour.
     """
-    return await _ask_async("codex", question, timeout)
+    fallback = "codex" if (os.environ.get("TEAMMATE_LABEL") or "").lower().startswith("claude") else None
+    if not target and fallback is None:
+        # We don't actually know which CLI is calling — let MCP decide
+        # from the legacy aliases below.
+        fallback = None
+    return await _ask_async(question, timeout, target=target, fallback_agent=fallback)
+
+
+@mcp.tool()
+async def ask_codex(question: str, timeout: int = 300) -> str:
+    """Legacy 1:1 helper. Prefer ``ask`` with an explicit ``target``."""
+    return await _ask_async(question, timeout, target="", fallback_agent="codex")
 
 
 @mcp.tool()
 async def ask_claude(question: str, timeout: int = 300) -> str:
-    """Ask the Claude pane a question and return its answer.
-
-    Use this from Codex when you want Claude's plan, design feedback,
-    or a sanity check.
-    """
-    return await _ask_async("claude", question, timeout)
+    """Legacy 1:1 helper. Prefer ``ask`` with an explicit ``target``."""
+    return await _ask_async(question, timeout, target="", fallback_agent="claude")
 
 
 @mcp.tool()
-async def broadcast(message: str) -> str:
-    """Push a message to both panes without waiting for a reply."""
+async def list_panes() -> list[dict]:
+    """Return every live iTerm pane plus its label/name/id/job/cwd.
+
+    Use this to see what targets are currently addressable. The shape of
+    each entry is::
+
+        {
+          "label":        "worker"   | None,
+          "session_name": "Worker A" | None,
+          "session_id":   "B913A27E-…",
+          "job":          "codex",
+          "cwd":          "/path/…",
+        }
+    """
     connection = await iterm2.Connection.async_create()
     try:
-        sent = []
-        for agent in ("claude", "codex"):
-            ref = await find_session_by_job(
-                connection, _jobname_for(agent), prefer_cwd=PROJECT_CWD
-            )
-            if ref is not None:
-                await send_text(ref, f"[teammate-mcp BROADCAST] {message}")
-                sent.append(agent)
+        return await describe_panes(connection)
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+@mcp.tool()
+async def register_self(label: str) -> str:
+    """Register the *calling* pane under ``label``.
+
+    Looks up the calling process's iTerm session via its
+    ``TERM_SESSION_ID`` env var. Subsequent ``ask(target=label, …)``
+    calls will route to this pane.
+    """
+    tsid = os.environ.get("TERM_SESSION_ID", "")
+    sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    if not sid_tail:
+        return "ERROR: no TERM_SESSION_ID — are you running inside iTerm?"
+
+    connection = await iterm2.Connection.async_create()
+    try:
+        from .iterm import list_sessions
+        refs = await list_sessions(connection)
+        match = None
+        for r in refs:
+            if r.session_id.upper().endswith(sid_tail.upper()) or r.session_id.upper() == sid_tail.upper():
+                match = r
+                break
+        if match is None:
+            return f"ERROR: could not find iTerm session {sid_tail}"
+        registry.register(
+            label=label,
+            session_id=match.session_id,
+            pid=os.getpid(),
+            job=match.job,
+            cwd=match.cwd,
+            extra={"session_name": match.name or None},
+        )
+        _log.event("register", label=label, session_id=match.session_id)
+        return f"registered {match.session_id} as {label!r}"
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
+@mcp.tool()
+async def unregister(label: str) -> str:
+    """Remove a label from the registry."""
+    registry.unregister(label)
+    _log.event("unregister", label=label)
+    return f"unregistered {label!r}"
+
+
+@mcp.tool()
+async def broadcast(message: str, targets: Optional[list[str]] = None) -> str:
+    """Push a message to one or more panes without waiting for a reply.
+
+    If ``targets`` is omitted, broadcasts to claude+codex (legacy mode).
+    """
+    connection = await iterm2.Connection.async_create()
+    try:
+        sent: list[str] = []
+        if targets:
+            for t in targets:
+                ref = await find_pane(connection, t)
+                if ref is not None:
+                    await send_text(ref, f"[teammate-mcp BROADCAST] {message}")
+                    sent.append(t)
+        else:
+            for agent in ("claude", "codex"):
+                ref = await find_session_by_job(
+                    connection, _jobname_for(agent), prefer_cwd=PROJECT_CWD
+                )
+                if ref is not None:
+                    await send_text(ref, f"[teammate-mcp BROADCAST] {message}")
+                    sent.append(agent)
         _log.event("broadcast", to=sent, len=len(message))
-        return f"sent to: {', '.join(sent) if sent else 'nobody (no matching panes)'}"
+        return f"sent to: {', '.join(sent) if sent else 'nobody'}"
     finally:
         try:
             connection.close()
@@ -160,9 +292,59 @@ def queue_status() -> dict:
     return _queue.status()
 
 
+def _auto_register_from_env() -> None:
+    """If the caller exported TEAMMATE_LABEL, attach it to this pane.
+
+    Runs once at server startup; failures are non-fatal (e.g. iTerm
+    Python API not enabled in CI).
+    """
+    label = os.environ.get("TEAMMATE_LABEL")
+    if not label:
+        return
+    tsid = os.environ.get("TERM_SESSION_ID", "")
+    sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    if not sid_tail:
+        return
+
+    async def _go():
+        try:
+            connection = await iterm2.Connection.async_create()
+        except Exception:
+            return
+        try:
+            from .iterm import list_sessions
+            refs = await list_sessions(connection)
+            for r in refs:
+                if r.session_id.upper().endswith(sid_tail.upper()):
+                    registry.register(
+                        label=label,
+                        session_id=r.session_id,
+                        pid=os.getpid(),
+                        job=r.job,
+                        cwd=r.cwd,
+                        extra={"session_name": r.name or None},
+                    )
+                    _log.event("auto_register", label=label, session_id=r.session_id)
+                    break
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    try:
+        asyncio.get_event_loop().run_until_complete(_go())
+    except RuntimeError:
+        # No running loop yet — start one just for this.
+        asyncio.run(_go())
+    except Exception:
+        pass
+
+
 def main():
     """Entry point used by `teammate-mcp` console script."""
     _log.event("server.start", queue_mode=QUEUE_MODE, cwd=PROJECT_CWD)
+    _auto_register_from_env()
     mcp.run()
 
 

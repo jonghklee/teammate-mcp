@@ -1,8 +1,8 @@
 # teammate-mcp
 
-> Let **Claude Code** and **OpenAI Codex** ask each other questions
-> through your iTerm panes. No daemon. No `.config` you have to
-> hand-edit per project. Just open two panes and they can talk.
+> Let **Claude Code** and **OpenAI Codex** panes talk to each other —
+> by **label**, by **iTerm session name**, or by **session id**.
+> N agents, M agents, mix-and-match. No daemon. No `.config` per project.
 
 ```
 ┌──────────── iTerm window ─────────────┐
@@ -15,16 +15,20 @@
 └───────────────────────────────────────┘
 ```
 
-`teammate-mcp` is a tiny MCP server that exposes two tools to whichever
-CLI loads it:
+`teammate-mcp` is a tiny MCP server that gives every loaded CLI a
+small toolbox:
 
-- `mcp__teammate__ask_codex(question, timeout)` — call from Claude
-- `mcp__teammate__ask_claude(question, timeout)` — call from Codex
+- `ask(target, question, timeout)` — primary. `target` is a label, an
+  iTerm session name, or a session-id prefix.
+- `list_panes()` — every live pane + its label/name/id/job/cwd.
+- `register_self(label)` — attach a label to the calling pane at runtime.
+- `broadcast(message, targets=[...])` — push to multiple panes at once.
+- `ask_codex` / `ask_claude` — legacy 1:1 shortcuts; still work when
+  exactly one of each CLI is running.
 
 The server uses the [iTerm2 Python API](https://iterm2.com/python-api/)
-to push the question into the *other* pane and read the reply back. The
-target pane is detected automatically by the running process — you don't
-label tabs, you don't pre-configure anything per project.
+to push the prompt into the target pane and read the reply back via a
+unique marker (`<<DONE_…>>`).
 
 ## Why?
 
@@ -102,18 +106,59 @@ Drop `templates/AGENTS.md` into your project root. Both Claude Code
 and Codex will pick it up automatically (it's the convention they
 both follow). The file tells them how and when to call each other.
 
-### 5. Try it
+### 5. (Optional) Add per-pane labels for N:M setups
+
+For more than one agent of either type, label each pane *before*
+launching its CLI:
+
+```sh
+# pane 1
+export TEAMMATE_LABEL=plan
+claude
+
+# pane 2
+export TEAMMATE_LABEL=worker
+codex
+
+# pane 3
+export TEAMMATE_LABEL=tester
+codex --yolo
+```
+
+The MCP server auto-registers each pane to its label on startup.
+Then from any pane:
+
+```
+ask("worker",  "implement foo()")
+ask("tester",  "write tests for foo()")
+ask("plan",    "review this design")    # from worker, asking back
+```
+
+You can also address a pane by the iTerm session name (`cmd+I`) or by
+any prefix of its UUID — `ask("Worker A", …)` or `ask("7B5B0D11", …)`.
+
+### 6. (Optional) Show the label in your status bar
+
+```sh
+./bin/install-statusline
+```
+
+Adds a `statusLine` block to `~/.claude/settings.json` and a precmd
+hook to `~/.zshrc` that updates the iTerm tab title from
+`$TEAMMATE_LABEL`. Both Claude (native statusLine) and Codex (tab
+title) show the label visibly. Idempotent; backs up your existing
+settings.
+
+### 7. Try it
 
 In the Claude pane:
 
 ```
-Ask Codex what timezone library it prefers in Python and tell me what
-it said.
+Ask the worker pane what timezone library it prefers in Python.
 ```
 
-You'll see Claude call `mcp__teammate__ask_codex`, the question
-appear in the right-hand pane, Codex respond, and Claude relay the
-answer.
+You'll see Claude call `ask`, the question appear in the *worker*
+pane, Codex respond there, and Claude relay the answer.
 
 ---
 

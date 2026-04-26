@@ -191,9 +191,9 @@ def _cmd_statusline() -> int:
     others_str = " ".join(others) if others else "(none)"
 
     if label:
-        print(f"🟢 {label}  │ team: {others_str}")
+        print(f"{label}  │ team: {others_str}")
     else:
-        print(f"⚪ unregistered  │ team: {others_str}  │ run /team-register")
+        print(f"unregistered  │ team: {others_str}  │ run /team-register")
     return 0
 
 

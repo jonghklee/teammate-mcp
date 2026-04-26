@@ -220,7 +220,54 @@ def _cmd_install_iterm() -> int:
         shutil.copy2(src, target_script)
     print(f"✓ AutoLaunch script: {target_script}")
 
-    # 2. Dynamic Profile JSON
+    # 2. Dynamic Profile JSON — including the full Status Bar Layout
+    # with our RPC component pre-installed. Built by encoding a
+    # protobuf RPCRegistrationRequest, exactly as iTerm2 does
+    # internally (see sources/StatusBar/Components/iTermStatusBar
+    # RPCProvidedTextComponent.m, key "registration request v2").
+    import base64 as _b64
+    try:
+        from iterm2 import api_pb2
+    except ImportError:
+        print("WARN: iterm2 protobuf not available — skipping Status Bar")
+        print("Layout pre-install. Status bar will be enabled but the user")
+        print("will still need to drag the component manually.")
+        layout_components = []
+    else:
+        req = api_pb2.RPCRegistrationRequest()
+        req.name = "teammate_label_provider"
+        req.role = api_pb2.RPCRegistrationRequest.STATUS_BAR_COMPONENT
+        # The function's signature on the AutoLaunch side accepts
+        # (knobs, session_id) — list every kw arg here.
+        for arg_name in ("session_id",):
+            req.arguments.add().name = arg_name
+        sba = req.status_bar_component_attributes
+        sba.short_description = "teammate label"
+        sba.detailed_description = "Shows the teammate-mcp label registered for this pane."
+        sba.exemplar = "[codex1]"
+        sba.update_cadence = 2.0
+        sba.unique_identifier = "com.teammate.label"
+        sba.format = api_pb2.RPCRegistrationRequest.StatusBarComponentAttributes.PLAIN_TEXT
+        encoded = _b64.b64encode(req.SerializeToString()).decode("ascii")
+
+        layout_components = [
+            {
+                "class": "iTermStatusBarRPCProvidedTextComponent",
+                "configuration": {
+                    "registration request v2": encoded,
+                    "knob values": {
+                        "base: priority": 5,
+                        "base: compression resistance": 1,
+                    },
+                    "layout advanced configuration dictionary value": {
+                        "remove empty components": True,
+                        "font": ".AppleSystemUIFont 12",
+                        "algorithm": 0,
+                    },
+                },
+            },
+        ]
+
     profile_path = dyn_dir / "teammate.json"
     profile = {
         "Profiles": [
@@ -229,23 +276,31 @@ def _cmd_install_iterm() -> int:
                 "Guid": "TEAMMATE-MCP-PROFILE-V1",
                 "Dynamic Profile Parent Name": "Default",
                 "Show Status Bar": True,
+                "Status Bar Layout": {
+                    "components": layout_components,
+                    "advanced configuration": {
+                        "remove empty components": True,
+                        "font": ".AppleSystemUIFont 12",
+                        "algorithm": 0,
+                        "auto-rainbow style": 0,
+                    },
+                },
             }
         ]
     }
     profile_path.write_text(_json.dumps(profile, indent=2))
     print(f"✓ Dynamic profile: {profile_path}")
+    if layout_components:
+        print(f"  • Status bar layout pre-installed with the 'teammate label' RPC component")
+    else:
+        print(f"  • Status bar enabled but layout NOT pre-installed (protobuf missing)")
 
     print()
-    print("Almost there. iTerm now needs ONE 10-second click:")
-    print()
-    print("  1. iTerm2 → Scripts → AutoLaunch → teammate_label.py  (run it)")
-    print("  2. iTerm2 → Settings (⌘,) → Profiles → Teammate → Session")
-    print("     → 'Configure Status Bar' → drag 'teammate label' from the")
-    print("     right panel into Active Components → OK")
-    print()
-    print("From then on, every pane you launch with the Teammate profile")
-    print("(or with `tmclaude` / `tmcodex` after this is wired up) shows")
-    print("its label at the bottom automatically.")
+    print("Final steps:")
+    print("  1. Restart iTerm2 (so it picks up the AutoLaunch script + the new profile).")
+    print("  2. Open a pane with the 'Teammate' profile (or run tmclaude / tmcodex).")
+    print("  3. Run /team-register or `teammate-mcp register-pane`.")
+    print("  → The label appears at the bottom of the pane automatically.")
     return 0
 
 

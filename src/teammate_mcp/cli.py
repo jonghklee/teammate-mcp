@@ -114,32 +114,42 @@ def _cmd_register_pane(argv: list[str]) -> int:
             )
             spawn_track.record(me.session_id, spawned_by=f"cli register-pane (pid {os.getpid()})")
 
-            # Make the label visible to the user via three iTerm channels:
-            #   1. tab title (top of window)             ESC ] 2 ; … BEL
-            #   2. iTerm badge (large overlay in pane)   ESC ] 1337 ; SetBadgeFormat=<b64> BEL
-            #   3. our own stdout (shell prints them)    same escape sequences
-            # The badge is the most visible indicator on Codex panes,
-            # which lack a Claude-Code-style status line.
+            # Visibility shotgun — set the label everywhere iTerm can
+            # render it. The user has many possible viewing surfaces
+            # (Profile-dependent), so we just hit all of them and at
+            # least one will be visible.
             import base64 as _b64
             badge_b64 = _b64.b64encode(label.encode()).decode()
-            tab_esc   = f"\x1b]2;[{label}]\x07"
-            badge_esc = f"\x1b]1337;SetBadgeFormat={badge_b64}\x07"
-
-            # Channel A — push via iTerm Python API to the matched session.
+            esc = "".join([
+                f"\x1b]0;[{label}]\x07",     # window title (top of window)
+                f"\x1b]1;[{label}]\x07",     # icon name
+                f"\x1b]2;[{label}]\x07",     # tab title
+                f"\x1b]1337;SetBadgeFormat={badge_b64}\x07",       # badge
+                f"\x1b]1337;SetUserVar=teammate_label={badge_b64}\x07",  # user var (status bar component)
+            ])
             try:
-                await me.session.async_send_text(tab_esc + badge_esc)
+                await me.session.async_send_text(esc)
             except Exception:
                 pass
+            sys.stdout.write(esc)
+            sys.stdout.flush()
 
-            # Channel B — write to our own stdout. Because register-pane
-            # runs in the same shell as the upcoming claude/codex, these
-            # escapes are processed by the *same* iTerm session before
-            # the CLI takes over the screen.
-            sys.stdout.write(tab_esc)
-            sys.stdout.write(badge_esc)
+            # In-pane visual banner — large coloured line that the user
+            # sees in their scrollback even after the CLI takes over.
+            banner = (
+                f"\x1b[1;7;36m"   # bold + reverse + cyan
+                f"  ▌ teammate-mcp ▌  this pane = {label}  "
+                f"\x1b[0m\n"
+            )
+            sys.stdout.write(banner)
 
             print(f"✓ registered as {label}  (session {me.session_id[:8]}…, "
                   f"job={me.job!r}, cwd={me.cwd})")
+            print(f"  → tab title, window title, and iTerm badge set to "
+                  f"[{label}]")
+            print(f"  → if nothing is visible: iTerm Preferences → "
+                  f"Profile → General → Badge (enable + bright color), "
+                  f"or Appearance → Panes → 'Show titles in tabs / panes'")
             return 0
         finally:
             try:

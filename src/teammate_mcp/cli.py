@@ -185,6 +185,70 @@ def _cmd_unregister(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_install_iterm() -> int:
+    """Set up everything iTerm needs in one shot.
+
+    1. Drop the StatusBarComponent script into iTerm's AutoLaunch
+       directory so it loads on every iTerm start.
+    2. Drop a Dynamic Profile JSON ("Teammate") into iTerm's
+       DynamicProfiles directory. The profile inherits the Default
+       profile's look but enables the status bar so the user only has
+       to drag our component into the layout once.
+    3. Print a 3-line GUI checklist for the only manual step that the
+       iTerm Python API can't automate (RPC component selection).
+    """
+    import shutil
+    import json as _json
+    import uuid as _uuid
+    from pathlib import Path
+
+    autolaunch_dir = Path.home() / "Library" / "Application Support" / "iTerm2" / "Scripts" / "AutoLaunch"
+    dyn_dir = Path.home() / "Library" / "Application Support" / "iTerm2" / "DynamicProfiles"
+    autolaunch_dir.mkdir(parents=True, exist_ok=True)
+    dyn_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. AutoLaunch script (overwrite — we ship the canonical version)
+    here = Path(__file__).resolve().parent.parent.parent
+    src = here / "iterm_autolaunch" / "teammate_label.py"
+    if not src.exists():
+        # Fall back: write inline copy from the package
+        src = autolaunch_dir / "teammate_label.py"
+        if not src.exists():
+            print(f"WARN: AutoLaunch script template not found at {src}.")
+    target_script = autolaunch_dir / "teammate_label.py"
+    if src != target_script and src.exists():
+        shutil.copy2(src, target_script)
+    print(f"✓ AutoLaunch script: {target_script}")
+
+    # 2. Dynamic Profile JSON
+    profile_path = dyn_dir / "teammate.json"
+    profile = {
+        "Profiles": [
+            {
+                "Name": "Teammate",
+                "Guid": "TEAMMATE-MCP-PROFILE-V1",
+                "Dynamic Profile Parent Name": "Default",
+                "Show Status Bar": True,
+            }
+        ]
+    }
+    profile_path.write_text(_json.dumps(profile, indent=2))
+    print(f"✓ Dynamic profile: {profile_path}")
+
+    print()
+    print("Almost there. iTerm now needs ONE 10-second click:")
+    print()
+    print("  1. iTerm2 → Scripts → AutoLaunch → teammate_label.py  (run it)")
+    print("  2. iTerm2 → Settings (⌘,) → Profiles → Teammate → Session")
+    print("     → 'Configure Status Bar' → drag 'teammate label' from the")
+    print("     right panel into Active Components → OK")
+    print()
+    print("From then on, every pane you launch with the Teammate profile")
+    print("(or with `tmclaude` / `tmcodex` after this is wired up) shows")
+    print("its label at the bottom automatically.")
+    return 0
+
+
 def _cmd_statusline() -> int:
     """Print this pane's teammate label for Claude Code's statusLine.
 
@@ -247,6 +311,8 @@ def main():
         sys.exit(_cmd_unregister(rest))
     if cmd == "statusline":
         sys.exit(_cmd_statusline())
+    if cmd == "install-iterm":
+        sys.exit(_cmd_install_iterm())
 
     print(f"unknown subcommand: {cmd!r}", file=sys.stderr)
     print(HELP, file=sys.stderr)

@@ -106,9 +106,14 @@ async def _ask_async(
         len=len(question),
     )
 
+    _log.event("ask.connect_start", id=msg.id)
     connection = await iterm2.Connection.async_create()
+    _log.event("ask.connect_ok", id=msg.id)
     try:
         ref = await _resolve_target(connection, target, fallback_agent)
+        _log.event("ask.resolve",
+                   id=msg.id, found=ref is not None,
+                   resolved_session=(ref.session_id if ref else None))
         if ref is None:
             _queue.fail(msg.id, "session not found")
             _log.event("ask.fail", id=msg.id, reason="session_not_found", target=addressee)
@@ -133,6 +138,7 @@ async def _ask_async(
 
         # Atomic claim before push so concurrent producers don't double-fire.
         _queue.claim(msg.id)
+        _log.event("ask.send_start", id=msg.id, to=addressee, session_id=ref.session_id)
         await send_text(ref, body)
         _log.event("ask.send", id=msg.id, to=addressee, session_id=ref.session_id)
 

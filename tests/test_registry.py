@@ -37,22 +37,20 @@ def test_unregister_removes_entry():
     assert registry.lookup("worker") is None
 
 
-def test_stale_pid_pruned_on_load():
+def test_stale_pid_no_longer_pruned():
+    """v0.3.2: PID-based pruning was removed because Codex's startup
+    fork/exec was killing the PID we recorded a second earlier,
+    silently losing the codex1 entry. Entries now persist until
+    explicit unregister."""
     registry.register("plan", "ABC", os.getpid(), "claude")
-    # Register a record with a PID that almost certainly isn't running.
     registry.register("ghost", "DEF", 999999, "codex")
-
-    # Manually verify the file has both entries before load() prunes.
-    raw = json.loads((registry.REGISTRY_PATH).read_text())
-    assert "ghost" in raw
-
     loaded = registry.load()
     assert "plan" in loaded
-    assert "ghost" not in loaded  # pruned
+    assert "ghost" in loaded  # no longer pruned
 
 
-def test_all_labels_returns_live_only():
+def test_all_labels_returns_everything():
     registry.register("a", "111", os.getpid(), "claude")
-    registry.register("b", "222", 999999, "codex")  # stale
+    registry.register("b", "222", 999999, "codex")
     labels = registry.all_labels()
-    assert set(labels.keys()) == {"a"}
+    assert set(labels.keys()) == {"a", "b"}

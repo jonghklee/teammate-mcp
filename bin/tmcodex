@@ -1,0 +1,12 @@
+#!/usr/bin/env zsh
+# tmcodex — register the current iTerm pane, then start Codex.
+TMM="${TEAMMATE_MCP_BIN:-$(dirname $0)/../.venv/bin/teammate-mcp}"
+DBG="${HOME}/.teammate-mcp/spawn-debug.log"
+mkdir -p "$(dirname $DBG)"
+{
+    echo "=== tmcodex $(date) PID=$$ TSID=${TERM_SESSION_ID:-none} ==="
+    sleep 1
+    "$TMM" register-pane "$@"
+    echo "register-pane exit=$?"
+} >> "$DBG" 2>&1
+exec codex --yolo

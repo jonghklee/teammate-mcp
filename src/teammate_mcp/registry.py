@@ -7,6 +7,9 @@ auto-pruned on read.
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import time
@@ -15,6 +18,36 @@ from typing import Optional
 
 
 REGISTRY_PATH = Path.home() / ".teammate-mcp" / "registry.json"
+LOCK_PATH = Path.home() / ".teammate-mcp" / "registry.lock"
+
+
+@contextlib.contextmanager
+def _exclusive_lock():
+    """Cross-process exclusive lock for registry mutations.
+
+    Without this, two simultaneous CLI register-pane calls can race
+    on the read-modify-write of registry.json and lose one entry.
+    """
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _ensure_dir() -> None:
@@ -48,16 +81,17 @@ def _save_raw(data: dict) -> None:
 
 
 def load() -> dict:
-    """Load registry, pruning entries whose owning process is gone."""
+    """Load registry. No PID-based pruning — that gave false positives
+    when CLIs (e.g. Codex) fork/exec themselves at startup, killing the
+    PID we recorded a second earlier. Entries are removed only via
+    explicit ``unregister`` or ``cleanup_my_panes.py`` (which uses the
+    spawn ledger, not PID liveness)."""
     raw = _load_raw()
-    pruned = {
+    return {
         label: rec
         for label, rec in raw.items()
-        if isinstance(rec, dict) and _alive(int(rec.get("pid", -1)))
+        if isinstance(rec, dict)
     }
-    if pruned != raw:
-        _save_raw(pruned)
-    return pruned
 
 
 def register(
@@ -68,23 +102,25 @@ def register(
     cwd: Optional[str] = None,
     extra: Optional[dict] = None,
 ) -> None:
-    data = load()
-    data[label] = {
-        "label": label,
-        "session_id": session_id,
-        "pid": pid,
-        "job": job,
-        "cwd": cwd,
-        "registered_at": time.time(),
-        **(extra or {}),
-    }
-    _save_raw(data)
+    with _exclusive_lock():
+        data = load()
+        data[label] = {
+            "label": label,
+            "session_id": session_id,
+            "pid": pid,
+            "job": job,
+            "cwd": cwd,
+            "registered_at": time.time(),
+            **(extra or {}),
+        }
+        _save_raw(data)
 
 
 def unregister(label: str) -> None:
-    data = load()
-    data.pop(label, None)
-    _save_raw(data)
+    with _exclusive_lock():
+        data = load()
+        data.pop(label, None)
+        _save_raw(data)
 
 
 def lookup(label: str) -> Optional[dict]:

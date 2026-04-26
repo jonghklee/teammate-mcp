@@ -186,14 +186,10 @@ def _cmd_statusline() -> int:
                 label = lbl
                 break
 
-    # All currently registered labels (sorted) for context.
-    others = sorted(registry.all_labels().keys())
-    others_str = " ".join(others) if others else "(none)"
-
     if label:
-        print(f"{label}  │ team: {others_str}")
+        print(f"[{label}]")
     else:
-        print(f"unregistered  │ team: {others_str}  │ run /team-register")
+        print("[unregistered]  run /team-register")
     return 0
 
 

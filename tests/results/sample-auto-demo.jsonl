@@ -1,0 +1,46 @@
+{
+  "scenario": "auto_demo_claude_asks_codex",
+  "started_at": "2026-04-26T06:14:13.766483+00:00",
+  "claude_pane_id": "D4C92DF5-1290-4DF2-A3FF-78C86CF16560",
+  "codex_pane_id": "7E39032F-C622-4DD7-A361-49EF9FC4B89E",
+  "status": "success",
+  "evidence": "mcp_log_ask_complete",
+  "marker": "<<DEMO_DONE_1777184088002>>",
+  "ask_completed_event": {
+    "ts": "2026-04-26T06:15:02.348+00:00",
+    "elapsed_ms": 42644,
+    "event": "ask.complete",
+    "id": "1777184099056-c5d085",
+    "answer_len": 3
+  },
+  "claude_answer_summary": "(MCP log confirmed round trip; Claude paraphrased instead of emitting literal marker)",
+  "claude_pane_tail": "\n❯ Run this exact tool call right     \n  now: mcp__teammate__ask_codex with \n   question=\"What is two plus two?   \n  Answer with the digit only.\" and   \n  timeout=120. After the tool        \n  returns, write one short line      \n  summarising the answer Codex gave  \n  you, then on the next line output  \n  exactly:                           \n  <<DEMO_DONE_1777184088002>>        \n\u0000\u0000                            \n  Calling teammate… (ctrl+o to       \n\u0000\u0000expand)              \n                                     \n✽ Crunching… (still thinking)\n                                     \n─────────────────────────────────────\n❯                          \n─────────────────────────────────────\n\u0000\u0000Context:\u00003%\u0000used\u0000(97%\u0000left) \u0000Opu…\n\u0000\u0000⏵⏵\u0000bypass\u0000permissions\u0000on \n",
+  "codex_pane_tail": "  Tip: Try the Codex App. Run 'codex\n  app' or visit\n  https://chatgpt.com/codex?app-landi\nng-page=true\n\n\n› [teammate-mcp ASK 1777184099056-\n  c5d085 from=claude]\n  What is two plus two? Answer with\n  the digit only.\n\n  When you finish, output exactly\n  this marker on its own line:\n  <<DONE_1777184099056-c5d085>>\n\n\n• 4\n  <<DONE_1777184099056-c5d085>>\n\n \n› Run /review on my current changes\n \n  gpt-5.5 default · ~/programming/te…",
+  "phases": [
+    {
+      "name": "spawn_and_boot",
+      "elapsed_ms": 25750
+    },
+    {
+      "name": "connect",
+      "elapsed_ms": 3
+    },
+    {
+      "name": "locate_panes",
+      "elapsed_ms": 55
+    },
+    {
+      "name": "prompts_settled",
+      "elapsed_ms": 8425
+    },
+    {
+      "name": "send_prompt",
+      "elapsed_ms": 254
+    },
+    {
+      "name": "marker_or_log_signal",
+      "elapsed_ms": 16015
+    }
+  ],
+  "total_ms": 50507
+}

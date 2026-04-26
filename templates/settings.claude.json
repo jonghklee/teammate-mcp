@@ -1,0 +1,22 @@
+{
+  "_comment": "Drop this into ~/.claude/settings.json (merge with your existing config). Adjust the command path if you installed teammate-mcp somewhere unusual.",
+
+  "mcpServers": {
+    "teammate": {
+      "command": "teammate-mcp",
+      "args": ["serve"],
+      "env": {
+        "TEAMMATE_QUEUE_MODE": "ephemeral"
+      }
+    }
+  },
+
+  "permissions": {
+    "allow": [
+      "mcp__teammate__ask_codex",
+      "mcp__teammate__ask_claude",
+      "mcp__teammate__broadcast",
+      "mcp__teammate__queue_status"
+    ]
+  }
+}

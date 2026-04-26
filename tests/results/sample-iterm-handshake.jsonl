@@ -1,0 +1,32 @@
+{
+  "scenario": "live_handshake_and_lookup",
+  "timestamp": "20260426T052228Z",
+  "phases": [
+    {
+      "name": "connect",
+      "elapsed_ms": 1
+    },
+    {
+      "name": "list_sessions",
+      "elapsed_ms": 14
+    },
+    {
+      "name": "find_codex",
+      "elapsed_ms": 60
+    }
+  ],
+  "total_ms": 77,
+  "session_count": 21,
+  "distinct_jobs": [
+    "Python",
+    "codex",
+    "tmux",
+    "zsh"
+  ],
+  "not_running": [
+    "claude"
+  ],
+  "located": {
+    "codex": "81B20664-B6C2-4DE6-A181-9C7AC8A5AB3E"
+  }
+}

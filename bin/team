@@ -1,0 +1,40 @@
+#!/usr/bin/env zsh
+# team — open a fresh iTerm window split into [Claude | Codex],
+# both rooted at the current working directory.
+#
+# This is purely a convenience helper. teammate-mcp itself works just fine
+# against any iTerm window where you happen to be running `claude` and
+# `codex` — pane labels are not required.
+
+set -euo pipefail
+
+cwd="${PWD}"
+left_cmd="${TEAMMATE_LEFT:-claude}"
+right_cmd="${TEAMMATE_RIGHT:-codex}"
+
+# Optional starter prompts. Set TEAMMATE_AGENTS_MD=path/to/AGENTS.md to
+# auto-load operating rules into both agents on startup.
+agents_md="${TEAMMATE_AGENTS_MD:-${cwd}/AGENTS.md}"
+
+osascript <<APPLESCRIPT
+tell application "iTerm"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "cd ${cwd}"
+        write text "${left_cmd}"
+    end tell
+    tell current tab of newWindow
+        set rightSession to (split vertically with default profile)
+        tell rightSession
+            write text "cd ${cwd}"
+            write text "${right_cmd}"
+        end tell
+    end tell
+end tell
+APPLESCRIPT
+
+echo "team: launched [${left_cmd} | ${right_cmd}] in ${cwd}"
+if [[ -f "${agents_md}" ]]; then
+    echo "team: AGENTS.md found at ${agents_md} — paste it into either pane to load operating rules"
+fi

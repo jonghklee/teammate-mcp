@@ -1,0 +1,9 @@
+# Append this block to ~/.codex/config.toml (or merge with the existing
+# [mcp_servers] section).
+
+[mcp_servers.teammate]
+command = "teammate-mcp"
+args = ["serve"]
+
+[mcp_servers.teammate.env]
+TEAMMATE_QUEUE_MODE = "ephemeral"

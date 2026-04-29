@@ -37,9 +37,18 @@ Usage:
                                 injection + marker poll).
   teammate-mcp inbox [LBL]      list pending mailbox entries for LBL
                                 (defaults to caller's own pane label)
+  teammate-mcp mark-processed   close a sync ask: write processed/<id>.json
+        <id> [--reply "..."]    with a reply field. (Aliases: ack, mark)
+        [--target LBL]
+  teammate-mcp drain [LBL]      run the inbox drain logic now and print
+                                pending mail (useful when MCP is dead
+                                or you don't want to type a prompt)
   teammate-mcp prune            remove every registry entry whose iTerm
                                 session is no longer open (also auto-runs
                                 inside `list` and `register-pane`)
+  teammate-mcp watch [--once]   watchdog: poll mailboxes, wake idle
+        [--interval N]          Claude Code panes by injecting /drain
+                                (only when compose box looks empty).
   teammate-mcp unregister LBL   remove a label from the registry
   teammate-mcp status           print queue status as JSON
   teammate-mcp version          print version
@@ -493,6 +502,122 @@ def _cmd_ask(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_mark_processed(argv: list[str]) -> int:
+    """Mark an inbox message as processed (closes a sync caller's poll).
+
+    Usage:
+        teammate-mcp mark-processed <job_id> [--reply "..."] [--target LBL]
+
+    Receivers whose MCP server has been killed (or who never had MCP)
+    can still close a sync ask loop via this CLI: write
+    ``processed/<job_id>.json`` with a ``terminal.reply`` field that
+    the original sender's poll picks up.
+    """
+    if not argv:
+        print("usage: teammate-mcp mark-processed <job_id> [--reply '…'] [--target LBL]",
+              file=sys.stderr)
+        return 2
+    job_id = argv[0]
+    reply = ""
+    target = ""
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--reply" and i + 1 < len(argv):
+            reply = argv[i + 1]
+            i += 2
+        elif a.startswith("--reply="):
+            reply = a.split("=", 1)[1]
+            i += 1
+        elif a == "--target" and i + 1 < len(argv):
+            target = argv[i + 1]
+            i += 2
+        elif a.startswith("--target="):
+            target = a.split("=", 1)[1]
+            i += 1
+        else:
+            print(f"ERROR: unknown arg {a!r}", file=sys.stderr)
+            return 2
+
+    if not target:
+        # Resolve caller's own label from TERM_SESSION_ID (sync mode
+        # receivers default to their own mailbox).
+        target = os.environ.get("TEAMMATE_LABEL", "").strip()
+        if not target:
+            from . import registry
+            tsid = os.environ.get("TERM_SESSION_ID", "")
+            sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+            for lbl, rec in registry.all_labels().items():
+                rec_sid = (rec.get("session_id") or "").upper()
+                if sid_tail and (rec_sid == sid_tail or rec_sid.endswith(sid_tail)):
+                    target = lbl
+                    break
+        if not target:
+            print("ERROR: no --target given and could not resolve caller label",
+                  file=sys.stderr)
+            return 2
+
+    from .server import _move_to_processed, _now_iso
+    try:
+        _move_to_processed(target, job_id,
+                           {"status": "completed", "reply": reply,
+                            "finished_at": _now_iso()})
+        print(f"✓ {job_id} marked processed for {target}")
+        if reply:
+            print(f"  reply: {reply[:80]!r}")
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e!r}", file=sys.stderr)
+        return 1
+
+
+def _cmd_drain(argv: list[str]) -> int:
+    """Run the inbox-drain logic on this pane and print the messages.
+
+    Useful when:
+      - the receiver's MCP is dead and the user wants to inspect mail
+      - testing the hook output without submitting a real prompt
+    """
+    from . import registry
+    label = (argv[0] if argv else "").strip()
+    if not label:
+        label = os.environ.get("TEAMMATE_LABEL", "").strip()
+        if not label:
+            tsid = os.environ.get("TERM_SESSION_ID", "")
+            sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+            for lbl, rec in registry.all_labels().items():
+                rec_sid = (rec.get("session_id") or "").upper()
+                if sid_tail and (rec_sid == sid_tail or rec_sid.endswith(sid_tail)):
+                    label = lbl
+                    break
+    if not label:
+        print("ERROR: no label given and could not resolve caller", file=sys.stderr)
+        return 2
+
+    # Re-use the same code path as the hook by spawning it.
+    from pathlib import Path
+    hook = (Path(__file__).resolve().parent.parent.parent
+            / "hooks" / "user_prompt_submit_inbox_drain.py")
+    if not hook.exists():
+        # Fallback: inline using server helpers
+        from .server import _list_inbox, _move_to_processed, _now_iso
+        items = _list_inbox(label)
+        if not items:
+            print(f"(empty inbox for {label})")
+            return 0
+        for d in items:
+            print(f"[{d.get('job_id','')[:18]}] from={d.get('from_')}: {d.get('body','')[:120]}")
+            _move_to_processed(label, d["job_id"],
+                               {"status": "drained_via_cli", "finished_at": _now_iso()})
+        return 0
+
+    import subprocess
+    r = subprocess.run([str(hook)], input="{}", capture_output=True, text=True,
+                       env={**os.environ, "TEAMMATE_LABEL": label}, timeout=5)
+    print(r.stdout)
+    return 0
+
+
 def _cmd_inbox(argv: list[str]) -> int:
     """List pending mailbox entries for a label.
 
@@ -746,6 +871,13 @@ def main():
         sys.exit(_cmd_ask(rest))
     if cmd == "inbox":
         sys.exit(_cmd_inbox(rest))
+    if cmd in ("mark-processed", "ack", "mark"):
+        sys.exit(_cmd_mark_processed(rest))
+    if cmd == "drain":
+        sys.exit(_cmd_drain(rest))
+    if cmd in ("watch", "watchdog"):
+        from .watcher import main as watcher_main
+        sys.exit(watcher_main(rest))
     if cmd == "unregister":
         sys.exit(_cmd_unregister(rest))
     if cmd == "statusline":

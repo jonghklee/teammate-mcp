@@ -392,26 +392,38 @@ def _cmd_ask(argv: list[str]) -> int:
     """
     timeout = 300
     wait = True
-    args = list(argv)
-    while args and args[0].startswith("-"):
-        flag = args.pop(0)
-        if flag in ("--timeout", "-t"):
-            if not args:
+    # Two-pass: extract flags from anywhere in argv, leaving positional
+    # args (label + question words) intact. This is forgiving of LLM
+    # output that puts --async/--timeout after the label.
+    args = []
+    src = list(argv)
+    while src:
+        a = src.pop(0)
+        if a in ("--timeout", "-t"):
+            if not src:
                 print("usage: teammate-mcp ask --timeout N <label> <question...>",
                       file=sys.stderr)
                 return 2
             try:
-                timeout = int(args.pop(0))
+                timeout = int(src.pop(0))
             except ValueError:
                 print(f"ERROR: --timeout must be an integer", file=sys.stderr)
                 return 2
-        elif flag in ("--no-wait", "--async"):
+        elif a in ("--no-wait", "--async"):
             wait = False
-        elif flag in ("--wait",):
+        elif a == "--wait":
             wait = True
+        elif a.startswith("--timeout="):
+            try:
+                timeout = int(a.split("=", 1)[1])
+            except ValueError:
+                print(f"ERROR: --timeout must be an integer", file=sys.stderr)
+                return 2
+        elif a == "--":
+            args.extend(src)
+            break
         else:
-            print(f"ERROR: unknown flag {flag!r}", file=sys.stderr)
-            return 2
+            args.append(a)
     if len(args) < 2:
         print("usage: teammate-mcp ask [--timeout N] [--no-wait] <label> <question...>",
               file=sys.stderr)

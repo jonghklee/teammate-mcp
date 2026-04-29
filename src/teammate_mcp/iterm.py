@@ -167,28 +167,22 @@ def osa_clear_and_inject(session_id: str, clear_count: int, body: str) -> None:
         f.write(body_clean)
         body_path = f.name
     n = max(0, int(clear_count))
-    # Build a multi-style clear sequence so it works on BOTH Claude
-    # Code (which honours DEL but mostly ignores Ctrl+U/A/K and
-    # responds to ESC ESC) AND Codex (which is line-mode-readline
-    # and honours Ctrl+U / Ctrl+A+K but may ignore Backspace bursts).
-    #
-    # Order matters:
-    #   ESC ESC            — Claude Code's "clear compose" hint
-    #   Ctrl+U  (0x15)     — readline kill-line-to-start
-    #   Ctrl+A  (0x01)     — readline beginning-of-line (Codex)
-    #   Ctrl+K  (0x0b)     — readline kill-to-end
-    #   DEL × N (0x7f)     — per-char backspace (catches whatever the
-    #                         above missed)
+    # Multi-style clear sequence — only emitted when n > 0. Empty
+    # files passed through `read POSIX file as «class utf8»` reliably
+    # crash osascript with a vague exit-1 ("Can't get text of …"),
+    # so when there's nothing to clear we skip the del file entirely.
+    del_path = None
     if n > 0:
         clear_payload = ("\x1b\x1b" + "\x15" + "\x01" + "\x0b"
                          + ("\x7f" * n))
-    else:
-        clear_payload = ""
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
-                                      delete=False, suffix=".del") as f:
-        f.write(clear_payload)
-        del_path = f.name
-    script = f'''
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                          delete=False,
+                                          suffix=".del") as f:
+            f.write(clear_payload)
+            del_path = f.name
+
+    if del_path:
+        script = f'''
 set delText to (read POSIX file "{del_path}" as «class utf8»)
 set theBody to (read POSIX file "{body_path}" as «class utf8»)
 tell application "iTerm"
@@ -196,9 +190,23 @@ tell application "iTerm"
         repeat with t in tabs of w
             repeat with s in sessions of t
                 if (unique id of s) is "{session_id}" then
-                    if length of delText > 0 then
-                        tell s to write text delText newline NO
-                    end if
+                    tell s to write text delText newline NO
+                    tell s to write text theBody newline NO
+                    tell s to write text (ASCII character 13) newline NO
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+    else:
+        script = f'''
+set theBody to (read POSIX file "{body_path}" as «class utf8»)
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
                     tell s to write text theBody newline NO
                     tell s to write text (ASCII character 13) newline NO
                 end if
@@ -212,6 +220,8 @@ end tell
                        capture_output=True, text=True, timeout=15)
     finally:
         for p in (del_path, body_path):
+            if p is None:
+                continue
             try: os.unlink(p)
             except OSError: pass
 

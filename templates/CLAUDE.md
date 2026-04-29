@@ -45,9 +45,40 @@ the turn.
 
 ### Asking another teammate
 
-When the user says things like "worker에게 시켜", "tester에게 물어봐",
-"옆 페인에게 물어봐", "claude20에게 명령 내려줘", "ask the other agent",
-**relay it autonomously without extended thinking**.
+**Trigger phrases — relay autonomously without extended thinking:**
+
+The user is asking you to forward something to another pane whenever
+they use any of these patterns. Treat the list as illustrative, not
+exhaustive — match the *intent*, not the exact words.
+
+Korean (가장 흔한 패턴들):
+- 명령: "OO에게 명령 내려줘", "OO한테 명령 보내", "OO 시켜"
+- 전달: "OO에게 전달해줘", "OO에게 전해줘", "OO한테 넘겨"
+- 대화: "OO랑 대화해줘", "OO랑 이야기해", "OO와 얘기해봐"
+- 질문: "OO에게 질문해줘", "OO한테 물어봐", "OO에게 ~~인지 물어봐"
+- 부탁/지시: "OO한테 ~~ 부탁해", "OO에게 ~~ 시켜줘", "OO에게 ~~ 해달라고 해"
+- 호출/응답확인: "OO 호출", "OO 거기 있어?", "OO ping"
+- 의견: "OO 의견 들어봐", "OO 생각 물어봐", "OO한테 컨설트해"
+- 보고/알림: "OO한테 알려줘", "OO에게 보고해", "OO한테 공유해"
+- 발화 위임: "OO에게 ~~라고 말해줘", "OO한테 ~~라고 전해"
+- broadcast 변형: "다들에게 ~~", "팀원 전체에게 ~~", "모두에게 알려"
+
+English:
+- "ask OO …", "tell OO …", "send OO …", "relay this to OO"
+- "have OO do …", "check with OO", "consult OO"
+- "ping OO", "ask the other agent", "ask the worker pane"
+- "broadcast to all panes" → use `mcp__teammate__broadcast`
+
+**Disambiguation — DO NOT trigger when:**
+- "OO에 **대해** 알려줘" / "tell me about OO" → user wants info *about* OO,
+  not to message it. Answer directly.
+- "OO 페인에서 ~~" / "in OO's pane …" → may be locative description only.
+  Trigger only when the verb is ask/send/relay/명령/물어 family.
+- User refers to their own pane ("이 페인", "여기", "this pane") — that's
+  the self-labelling case (register / whoami); do not call `ask`.
+
+**When in doubt, prefer asking the user one short clarifying question
+over silent guessing.** But for clear cases above, dispatch immediately.
 
 **Preferred path — Bash CLI (fast, deterministic, no MCP round-trip):**
 

@@ -196,12 +196,25 @@ def _cmd_register_pane(argv: list[str]) -> int:
         return 2
 
     # Auto-prune stale entries before this register so dead claudeN/codexN
-    # numbers are recycled instead of monotonically growing.
+    # numbers are recycled instead of monotonically growing. The prune
+    # also archives the dead labels' mailboxes so the new register
+    # never inherits a stale inbox.
     try:
         from . import registry as _reg
         _reg.prune_dead(force_refresh=True)
     except Exception:
         pass
+    # Belt-and-suspenders: also archive any mailbox that already exists
+    # for the label we're about to use — covers the race where prune
+    # didn't run (iTerm fully restarted, alive set was empty, prune
+    # was a no-op) but the user still wants a fresh inbox under the
+    # same label.
+    if explicit_label:
+        try:
+            from .server import archive_label_mailbox
+            archive_label_mailbox(explicit_label)
+        except Exception:
+            pass
 
     # ---- Path B: osascript fallback (handles sandboxed callers) -----
     def _register_via_osascript() -> int:

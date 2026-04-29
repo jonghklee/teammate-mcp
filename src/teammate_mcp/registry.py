@@ -193,4 +193,15 @@ def prune_dead(force_refresh: bool = False) -> list[str]:
                 data.pop(label, None)
         if removed:
             _save_raw(data)
+    # Archive mailboxes of removed labels so their old inbox/processed
+    # never bleeds into a future label collision (e.g. claude5 closed,
+    # new pane later registered as claude5 — without this, the new
+    # pane's hook would drain stale messages).
+    if removed:
+        try:
+            from .server import archive_label_mailbox
+            for label in removed:
+                archive_label_mailbox(label)
+        except Exception:
+            pass
     return removed

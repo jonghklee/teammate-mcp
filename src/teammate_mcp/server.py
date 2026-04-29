@@ -119,6 +119,41 @@ def _list_inbox(label: str) -> list[dict]:
     return out
 
 
+def archive_label_mailbox(label: str) -> Optional[Path]:
+    """Move ~/.teammate-mcp/mailbox/<label>/ aside.
+
+    Called by register-pane and by prune_dead when a label is recycled
+    or removed: prevents the "옛 mailbox에 잔존하는 메시지를 새 페인의
+    hook이 drain" 혼동.
+
+    Returns the archived path, or None if there was nothing to archive.
+    """
+    src = MAILBOX_ROOT / label
+    if not src.exists() or not src.is_dir():
+        return None
+    # Skip pure-empty trees (no point archiving)
+    has_any = False
+    for sub in ("inbox", "processed"):
+        d = src / sub
+        if d.exists() and any(d.glob("*.json")):
+            has_any = True
+            break
+    if not has_any:
+        # Empty mailbox — just remove instead of archiving for tidiness.
+        try:
+            import shutil
+            shutil.rmtree(src, ignore_errors=True)
+        except Exception:
+            pass
+        return None
+    archive = MAILBOX_ROOT / f".archived-{label}-{int(time.time())}"
+    try:
+        src.rename(archive)
+        return archive
+    except Exception:
+        return None
+
+
 async def _wait_until_safe(sid: str, max_wait: float = 30.0) -> tuple[bool, Optional[str]]:
     """Poll the target pane's last screen lines for danger patterns.
 

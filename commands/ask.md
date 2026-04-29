@@ -1,18 +1,22 @@
 ---
-description: "Ask another registered pane via the teammate-mcp CLI (bypasses MCP tool to skip deferred-schema load + extended-thinking overhead). Usage: /ask [--async] <label> <question...>"
+description: "Ask another registered pane via the teammate-mcp CLI (bypasses MCP tool to skip deferred-schema load + extended-thinking overhead). Default ASYNC. Usage: /ask <label> <question...>"
 ---
 
 Parse the slash arguments. The first non-flag token is the target
 label (e.g. `claude1`, `codex1`, `worker`). Everything after it is the
 question, taken verbatim.
 
-Supported flags (anywhere before the label):
-- `--async` / `--no-wait`: fire-and-forget mailbox mode. Caller is not
-  blocked; target replies via a reverse `ask` (email model). Use this
-  for "send and continue" — long tasks, background notifications,
-  multi-pane choreography.
-- `--timeout N`: sync timeout in seconds (default 300; ignored with
-  `--async`).
+**As of v0.8.0 the default is ASYNC** (mailbox / file-only delivery).
+The caller is never blocked, and the target's compose box / interactive
+bash / permission prompts are never corrupted by injected keystrokes.
+
+Supported flags (anywhere in the args):
+- `--wait`: legacy SYNC mode — inject keystrokes + poll the target's
+  screen for a completion marker. Use only when the caller cannot
+  proceed without the inline reply. Will MERGE with text the user is
+  mid-typing in the target compose box, so prefer the default.
+- `--async` / `--no-wait`: explicit async (default; included for clarity).
+- `--timeout N`: sync timeout in seconds (default 300; ignored when async).
 
 **Run this exact Bash command** — do NOT call `mcp__teammate__ask`,
 which is the whole point of this slash command. The MCP tool path
@@ -25,7 +29,8 @@ incurs:
 The CLI bypasses both:
 
 ```bash
-teammate-mcp ask [--async] [--timeout N] <LABEL> "<QUESTION>"
+teammate-mcp ask <LABEL> "<QUESTION>"          # async (default)
+teammate-mcp ask --wait <LABEL> "<QUESTION>"   # legacy sync
 ```
 
 Substitute `<LABEL>` and `<QUESTION>`; escape any literal `"` inside

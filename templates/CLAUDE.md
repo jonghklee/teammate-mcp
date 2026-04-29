@@ -83,8 +83,15 @@ over silent guessing.** But for clear cases above, dispatch immediately.
 **Preferred path — Bash CLI (fast, deterministic, no MCP round-trip):**
 
 ```bash
-teammate-mcp ask <LABEL> "<QUESTION>" --timeout 300
+teammate-mcp ask <LABEL> "<QUESTION>"          # async (default since v0.8.0)
+teammate-mcp ask --wait <LABEL> "<QUESTION>"   # only when you must block for the reply
 ```
+
+The default is async — the message goes through the receiver's mailbox
+file and is drained by their UserPromptSubmit hook, so the target's
+compose-box never gets clobbered with our injected text. Reply
+arrives later as a reverse async ask in the caller's own inbox; the
+caller sees it on their next prompt.
 
 This bypasses the deferred MCP tool schema load and avoids extended
 thinking on tool routing. Use this whenever the target label is

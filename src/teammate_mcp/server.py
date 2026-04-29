@@ -235,7 +235,7 @@ async def _ask_async(
     timeout: int,
     target: str = "",
     fallback_agent: Optional[str] = None,
-    wait: bool = True,
+    wait: bool = False,
     safe_max_wait: float = 30.0,
 ) -> str:
     """Drive one ask: enqueue → push (osascript) → [optionally wait] → return.
@@ -412,7 +412,7 @@ async def _ask_async(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = True) -> str:
+async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = False) -> str:
     """Ask another pane a question.
 
     ``target`` may be:
@@ -423,14 +423,19 @@ async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = 
       * a session UUID prefix (≥ 6 chars).
 
     ``wait``:
-      * ``True`` (default, sync): inject the message and poll the
-        target's screen for a completion marker. Returns the answer,
-        or TIMEOUT after ``timeout`` seconds.
-      * ``False`` (async / fire-and-forget mailbox model): inject the
-        message, persist to ``~/.teammate-mcp/mailbox/<target>/inbox/``,
-        return immediately with ``"queued: job_id=… to …"``. The target
-        is instructed to reply via a reverse async ``ask``. Use this
-        when you don't want the caller blocked.
+      * ``False`` (default, async / mailbox / "email" mode): persist the
+        message to ``~/.teammate-mcp/mailbox/<target>/inbox/`` only —
+        NO keystroke injection. The receiver's ``UserPromptSubmit``
+        hook drains the inbox on its next user prompt and the LLM
+        replies via reverse async ``ask``. Caller is never blocked,
+        and the receiver's compose box / interactive bash / permission
+        prompts are NEVER corrupted.
+      * ``True`` (legacy sync): inject keystrokes into the target's
+        TUI and poll the target's screen for a completion marker.
+        Returns the answer or TIMEOUT after ``timeout`` seconds. Will
+        merge with text the user is mid-typing in the target compose
+        box, so prefer ``wait=False`` unless the caller genuinely
+        cannot proceed without the inline answer.
 
     When ``target`` is empty the caller's job name is used: a Claude
     caller falls back to "codex" and vice versa, preserving the v0.1

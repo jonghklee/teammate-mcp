@@ -28,9 +28,12 @@ Usage:
   teammate-mcp list             print every registered pane
   teammate-mcp whoami           print THIS pane's label (or "(unregistered)")
   teammate-mcp exists LBL       exit 0 if LBL is registered, 1 if not
-  teammate-mcp ask LBL Q...     ask LBL the question Q, print the answer
-                                (--timeout N to override default 300s,
-                                 --no-wait for async / fire-and-forget mailbox mode)
+  teammate-mcp ask LBL Q...     ask LBL the question Q.
+                                Default: ASYNC / mailbox (file-only, no
+                                keystroke injection — caller never blocks,
+                                target's compose box never corrupted).
+                                Use --wait for legacy sync mode (keystroke
+                                injection + marker poll).
   teammate-mcp inbox [LBL]      list pending mailbox entries for LBL
                                 (defaults to caller's own pane label)
   teammate-mcp unregister LBL   remove a label from the registry
@@ -376,22 +379,28 @@ def _cmd_whoami() -> int:
 def _cmd_ask(argv: list[str]) -> int:
     """One-shot ask: send a question to a registered pane.
 
-    Usage:
-        teammate-mcp ask <label> <question...>
-        teammate-mcp ask --timeout 60 <label> <question...>
-        teammate-mcp ask --no-wait <label> <question...>     # mailbox / fire-and-forget
+    Usage (default is ASYNC / mailbox mode as of v0.8.0):
+        teammate-mcp ask <label> <question...>             # async, file-only
+        teammate-mcp ask --wait <label> <question...>      # legacy sync
+        teammate-mcp ask --timeout 60 --wait <label> <question...>
 
     Flags:
-        --timeout N    sync timeout in seconds (default 300; ignored with --no-wait)
-        --no-wait      async mailbox mode — inject + persist to inbox + return immediately
-                       with "queued: job_id=… to <label>". Target replies via reverse ask.
-        -t N           alias for --timeout
+        --wait         legacy sync mode (keystroke injection + marker poll).
+                       Use only when the caller cannot proceed without the
+                       inline reply. Will MERGE with text the user is
+                       mid-typing in the target's compose box.
+        --no-wait      explicit async (the default; included for clarity).
+        --async        alias for --no-wait.
+        --timeout N    sync timeout in seconds (default 300; ignored when async).
+        -t N           alias for --timeout.
 
-    Reuses the server's `_ask_async` (same code path as the MCP `ask`
-    tool).
+    Async mode persists the message to
+    ``~/.teammate-mcp/mailbox/<label>/inbox/`` and returns immediately.
+    The target's UserPromptSubmit hook drains the inbox on its next
+    user prompt; the target then replies via reverse async ask.
     """
     timeout = 300
-    wait = True
+    wait = False  # v0.8.0: default async (mailbox/file-only delivery)
     # Two-pass: extract flags from anywhere in argv, leaving positional
     # args (label + question words) intact. This is forgiving of LLM
     # output that puts --async/--timeout after the label.

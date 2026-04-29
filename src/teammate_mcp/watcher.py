@@ -183,7 +183,14 @@ def main(argv: list[str] | None = None) -> int:
     if tsid:
         self_sid = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
 
-    seen: dict[str, set[str]] = {}
+    # last_wake[label] = (mtime, attempted_at). We treat a label as
+    # "needing wake" if the inbox has any file with mtime > last_wake.
+    # This avoids both (a) re-waking forever on a single stuck file
+    # and (b) missing new files because seen-set still remembers old
+    # ones. Cooldown also prevents spam during the receiver's
+    # multi-second LLM processing window.
+    last_wake: dict[str, float] = {}
+    COOLDOWN = 6.0  # seconds — must be > 1 LLM round trip
     _log(f"watchdog start interval={args.interval}s self_sid={self_sid[:8] or '(unknown)'}")
 
     def _scan_once() -> int:
@@ -200,30 +207,40 @@ def main(argv: list[str] | None = None) -> int:
                 # user is actively typing in it, so the hook will fire
                 # naturally on their next prompt.
                 continue
-            if (rec.get("job") or "").lower() != "python":
-                # Codex / shell panes have no hook; can't wake usefully.
-                continue
+            # We don't filter by job anymore — the registry's job field
+            # often lags reality (e.g. tmclaude's register-pane runs
+            # while the shell is still zsh, then exec claude replaces
+            # the shell but the registry keeps "zsh"). Wake all alive
+            # panes; if a pane has no hook (codex / plain shell), the
+            # injected "." just becomes a harmless prompt that the
+            # underlying TUI either echoes or ignores. Compose-empty
+            # detection still gates against busy panes.
             inbox = MAILBOX / label / "inbox"
             if not inbox.exists():
                 continue
-            current = {p.name for p in inbox.glob("*.json")}
-            if not current:
-                seen[label] = set()
+            files = list(inbox.glob("*.json"))
+            if not files:
                 continue
-            new = current - seen.get(label, set())
-            if not new:
+            newest_mtime = max(f.stat().st_mtime for f in files)
+            now = time.time()
+            since_last = now - last_wake.get(label, 0.0)
+            if newest_mtime <= last_wake.get(label, 0.0):
+                # No file newer than the last wake — already in
+                # someone's processing pipeline.
+                continue
+            if since_last < COOLDOWN:
+                # Cooldown — give the receiver time to finish its LLM
+                # turn before we poke it again.
                 continue
             if _compose_is_empty(sid):
                 if _wake(sid):
-                    _log(f"woke label={label} for {len(new)} new msg")
+                    _log(f"woke label={label} for {len(files)} pending msg")
                     woken += 1
-                    seen[label] = current
+                    last_wake[label] = now
                 else:
                     _log(f"wake-attempt-failed label={label}")
             else:
-                _log(f"skip-busy label={label} ({len(new)} new msg)")
-                # Don't update seen — try again next tick once compose
-                # clears.
+                _log(f"skip-busy label={label} ({len(files)} pending msg)")
         return woken
 
     if args.once:

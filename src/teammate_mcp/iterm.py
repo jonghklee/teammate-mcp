@@ -167,20 +167,24 @@ def osa_clear_and_inject(session_id: str, clear_count: int, body: str) -> None:
         f.write(body_clean)
         body_path = f.name
     n = max(0, int(clear_count))
-    # Multi-style clear sequence — only emitted when n > 0. Empty
-    # files passed through `read POSIX file as «class utf8»` reliably
-    # crash osascript with a vague exit-1 ("Can't get text of …"),
-    # so when there's nothing to clear we skip the del file entirely.
+    # Simple per-character DEL — Claude Code's compose box honours
+    # Backspace (0x7f) reliably. We deliberately do NOT mix in
+    # ESC ESC / Ctrl+U / Ctrl+A / Ctrl+K (those were a codex-specific
+    # workaround that broke more than it fixed). When n is 0 we skip
+    # the del file entirely — empty utf8 reads crash osascript.
     del_path = None
     if n > 0:
-        clear_payload = ("\x1b\x1b" + "\x15" + "\x01" + "\x0b"
-                         + ("\x7f" * n))
+        clear_payload = "\x7f" * n
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
                                           delete=False,
                                           suffix=".del") as f:
             f.write(clear_payload)
             del_path = f.name
 
+    # CRITICAL: delay 0.05 between writes, otherwise iTerm bundles
+    # them under one bracket-paste envelope and the lone CR gets
+    # eaten — TUI never sees Enter, body sits in compose unsubmitted.
+    # User reported this as "메시지는 보내지는데 enter가 안눌러짐".
     if del_path:
         script = f'''
 set delText to (read POSIX file "{del_path}" as «class utf8»)
@@ -191,7 +195,9 @@ tell application "iTerm"
             repeat with s in sessions of t
                 if (unique id of s) is "{session_id}" then
                     tell s to write text delText newline NO
+                    delay 0.05
                     tell s to write text theBody newline NO
+                    delay 0.05
                     tell s to write text (ASCII character 13) newline NO
                 end if
             end repeat
@@ -208,6 +214,7 @@ tell application "iTerm"
             repeat with s in sessions of t
                 if (unique id of s) is "{session_id}" then
                     tell s to write text theBody newline NO
+                    delay 0.05
                     tell s to write text (ASCII character 13) newline NO
                 end if
             end repeat
@@ -263,13 +270,13 @@ end tell
             pass
 
 
-# Match common compose prompt lines. Patterns seen on real panes:
-#   Claude Code:  "  ❯ user typed text here"   /   "  ❯ "
-#   Codex CLI:    "  ▌ user typed text here"
-# We deliberately drop bare ">" — it appears inside ASK body lines
-# like "<your reply>" and inside markdown blockquotes, causing
-# false-positive captures of our own echoed payload.
-_COMPOSE_LINE_RE = re.compile(r"^\s*[❯▌]\s?(.*)$")
+# Match Claude Code's compose prompt line. Examples:
+#   "  ❯ user typed text here"
+#   "  ❯ "         (empty)
+# We allow leading whitespace before ❯ and capture everything after.
+# Codex compose detection was removed — its prompt char (›/>) caused
+# too many false positives matching ASK body lines.
+_COMPOSE_LINE_RE = re.compile(r"^\s*❯\s?(.*)$")
 
 
 def osa_extract_compose(session_id: str) -> str:

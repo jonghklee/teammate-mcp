@@ -112,7 +112,7 @@ for r in $(seq 1 "$ROUNDS"); do
     "$BIN" ask "$receiver" "$msg" >/dev/null
 
     # SELF 의 inbox에 receiver 가 답장 도착할 때까지 대기 (max 60s)
-    deadline=$(( $(date +%s) + 180 ))
+    deadline=$(( $(date +%s) + 60 ))
     reply=""
     PROCESSED_SELF="$HOME/.teammate-mcp/mailbox/$SELF/processed"
     mkdir -p "$PROCESSED_SELF"

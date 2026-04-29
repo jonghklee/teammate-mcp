@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from typing import Optional
 
 from . import __version__
 from .queue import MessageQueue
@@ -25,6 +26,10 @@ Usage:
                                 BEFORE you launch claude/codex in the
                                 same pane.
   teammate-mcp list             print every registered pane
+  teammate-mcp whoami           print THIS pane's label (or "(unregistered)")
+  teammate-mcp exists LBL       exit 0 if LBL is registered, 1 if not
+  teammate-mcp ask LBL Q...     ask LBL the question Q, print the answer
+                                (--timeout N to override default 300s)
   teammate-mcp unregister LBL   remove a label from the registry
   teammate-mcp status           print queue status as JSON
   teammate-mcp version          print version
@@ -45,8 +50,115 @@ Recommended workflow:
 """
 
 
+def _osa_session_info(sid_tail: str) -> Optional[dict]:
+    """Query iTerm via osascript to fetch the calling pane's info.
+
+    Used as a fallback when the iterm2 Python lib cannot connect — most
+    notably when the caller is running inside a macOS App Sandbox (codex
+    CLI's bash tool) which blocks Unix-socket connect() with EPERM.
+    AppleScript is delivered through a separate osascript process whose
+    Apple Event channel is not subject to the caller's sandbox.
+    """
+    import subprocess
+    # iTerm's `tty` is the most reliable bridge: TERM_SESSION_ID's tail
+    # equals the session's `unique id`. `cwd of session` only exists on
+    # newer iTerm; fall back to ~ if missing.
+    script = f'''
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{sid_tail.upper()}" then
+                    set sName to name of s
+                    set sTTY to tty of s
+                    set sId  to unique id of s
+                    return sId & "|" & sName & "|" & sTTY
+                end if
+            end repeat
+        end repeat
+    end repeat
+    return ""
+end tell
+'''
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    line = (out.stdout or "").strip()
+    if not line or "|" not in line:
+        return None
+    parts = line.split("|")
+    if len(parts) < 3:
+        return None
+    sid, name, tty = parts[0], parts[1], parts[2]
+    # Resolve job + cwd from the tty's foreground process.
+    job, cwd = _proc_info_for_tty(tty)
+    return {"session_id": sid, "name": name, "tty": tty,
+            "job": job, "cwd": cwd}
+
+
+def _proc_info_for_tty(tty: str) -> tuple[str, str]:
+    """Return (job, cwd) of the foreground process on a tty.
+
+    Pure shell — no iterm2 lib. Walks ``ps`` output for processes
+    attached to the tty, picks the most recently started one (typically
+    the running CLI), then asks ``lsof`` for its cwd.
+    """
+    import subprocess
+    tty_short = tty.replace("/dev/", "")
+    try:
+        ps = subprocess.run(
+            ["ps", "-t", tty_short, "-o", "pid=,stat=,command="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return ("?", os.path.expanduser("~"))
+    pids = []
+    for ln in ps.stdout.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        # Foreground processes have '+' in stat
+        parts = ln.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, stat, cmd = parts
+        if "+" in stat:
+            pids.append((int(pid_s), cmd))
+    # Prefer the LAST foreground process (deepest child)
+    if not pids:
+        return ("?", os.path.expanduser("~"))
+    pid, cmd = pids[-1]
+    # Job name = first whitespace-separated token of cmd, basename only
+    first = cmd.split()[0] if cmd else "?"
+    job = os.path.basename(first.split("/")[-1])
+    # cwd via lsof
+    try:
+        lsof = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=3,
+        )
+        cwd = os.path.expanduser("~")
+        for ln in lsof.stdout.splitlines():
+            if ln.startswith("n"):
+                cwd = ln[1:]
+                break
+    except Exception:
+        cwd = os.path.expanduser("~")
+    return (job, cwd)
+
+
 def _cmd_register_pane(argv: list[str]) -> int:
-    """Register the calling shell's iTerm pane — no LLM in the loop."""
+    """Register the calling shell's iTerm pane — no LLM in the loop.
+
+    Two-layer connection strategy:
+      (A) iterm2 Python lib via Unix socket — fast, full-featured
+      (B) osascript fallback — works when (A) is blocked by sandbox
+          (codex CLI's bash tool gets EPERM on the socket connect)
+    """
     explicit_label = ""
     if len(argv) > 0 and not argv[0].startswith("-"):
         explicit_label = argv[0]
@@ -58,6 +170,58 @@ def _cmd_register_pane(argv: list[str]) -> int:
         print("ERROR: no TERM_SESSION_ID — are you running inside iTerm?", file=sys.stderr)
         return 2
 
+    # ---- Path B: osascript fallback (handles sandboxed callers) -----
+    def _register_via_osascript() -> int:
+        info = _osa_session_info(sid_tail)
+        if info is None:
+            print("ERROR: osascript fallback could not locate iTerm session "
+                  f"{sid_tail}. Ensure iTerm is running and the pane is open.",
+                  file=sys.stderr)
+            return 2
+        from .server import _next_auto_label
+        from . import registry, spawn_track
+        existing = next(
+            (l for l, r in registry.all_labels().items()
+             if (r.get("session_id") or "").upper() == info["session_id"].upper()),
+            None,
+        )
+        label = explicit_label or existing or _next_auto_label(info["job"], info["name"] or "")
+        registry.register(
+            label=label,
+            session_id=info["session_id"],
+            pid=os.getpid(),
+            job=info["job"],
+            cwd=info["cwd"],
+            extra={"session_name": info["name"] or None,
+                   "auto_assigned": not explicit_label,
+                   "via": "cli-osa-fallback"},
+        )
+        spawn_track.record(info["session_id"],
+                           spawned_by=f"cli register-pane fallback (pid {os.getpid()})")
+        # Only emit visibility escape sequences when stdout is a real TTY
+        # (i.e. running pre-CLI from a plain shell). When stdout is a pipe
+        # — the case when codex/claude's bash tool captures our output —
+        # the ANSI banner becomes garbage in the agent's UI block and the
+        # OSC sequences are stuck in the pipe (no live rendering anyway).
+        if sys.stdout.isatty():
+            import base64 as _b64
+            badge_b64 = _b64.b64encode(label.encode()).decode()
+            esc = (
+                f"\x1b]0;[{label}]\x07"
+                f"\x1b]1;[{label}]\x07"
+                f"\x1b]2;[{label}]\x07"
+                f"\x1b]1337;SetBadgeFormat={badge_b64}\x07"
+                f"\x1b]1337;SetUserVar=teammate_label={badge_b64}\x07"
+            )
+            sys.stdout.write(esc)
+            sys.stdout.write(
+                f"\x1b[1;7;36m  ▌ teammate-mcp ▌  this pane = {label}  \x1b[0m\n"
+            )
+            sys.stdout.flush()
+        print(f"✓ registered as {label}  (session {info['session_id'][:8]}…, "
+              f"job={info['job']!r}, cwd={info['cwd']})  [osa fallback]")
+        return 0
+
     async def _go():
         try:
             import iterm2
@@ -67,6 +231,10 @@ def _cmd_register_pane(argv: list[str]) -> int:
         try:
             connection = await iterm2.Connection.async_create()
         except Exception as e:
+            # Sandbox / EPERM / iTerm not running — try osascript path.
+            err = str(e)
+            if "Operation not permitted" in err or "Errno 1" in err:
+                return _register_via_osascript()
             print(f"ERROR: cannot connect to iTerm Python API ({e}). "
                   f"Enable it in iTerm Settings → General → Magic.", file=sys.stderr)
             return 2
@@ -114,42 +282,38 @@ def _cmd_register_pane(argv: list[str]) -> int:
             )
             spawn_track.record(me.session_id, spawned_by=f"cli register-pane (pid {os.getpid()})")
 
-            # Visibility shotgun — set the label everywhere iTerm can
-            # render it. The user has many possible viewing surfaces
-            # (Profile-dependent), so we just hit all of them and at
-            # least one will be visible.
-            import base64 as _b64
-            badge_b64 = _b64.b64encode(label.encode()).decode()
-            esc = "".join([
-                f"\x1b]0;[{label}]\x07",     # window title (top of window)
-                f"\x1b]1;[{label}]\x07",     # icon name
-                f"\x1b]2;[{label}]\x07",     # tab title
-                f"\x1b]1337;SetBadgeFormat={badge_b64}\x07",       # badge
-                f"\x1b]1337;SetUserVar=teammate_label={badge_b64}\x07",  # user var (status bar component)
-            ])
-            try:
-                await me.session.async_send_text(esc)
-            except Exception:
-                pass
-            sys.stdout.write(esc)
-            sys.stdout.flush()
-
-            # In-pane visual banner — large coloured line that the user
-            # sees in their scrollback even after the CLI takes over.
-            banner = (
-                f"\x1b[1;7;36m"   # bold + reverse + cyan
-                f"  ▌ teammate-mcp ▌  this pane = {label}  "
-                f"\x1b[0m\n"
-            )
-            sys.stdout.write(banner)
+            # Visibility — only fire ANSI/OSC sequences when our stdout
+            # is a real terminal (running pre-CLI from a plain shell).
+            # When stdout is a pipe (codex/claude bash tool capturing
+            # the output), the escape bytes either get rendered as
+            # garbage in the agent UI or get stuck in the pipe — they
+            # never reach iTerm's live parser anyway. Skipping them
+            # avoids the "input prompt looks broken after register" bug.
+            if sys.stdout.isatty():
+                import base64 as _b64
+                badge_b64 = _b64.b64encode(label.encode()).decode()
+                esc = "".join([
+                    f"\x1b]0;[{label}]\x07",
+                    f"\x1b]1;[{label}]\x07",
+                    f"\x1b]2;[{label}]\x07",
+                    f"\x1b]1337;SetBadgeFormat={badge_b64}\x07",
+                    f"\x1b]1337;SetUserVar=teammate_label={badge_b64}\x07",
+                ])
+                # async_send_text wraps in bracket-paste — for a TUI like
+                # codex/claude this leaves literal escape bytes inside the
+                # input box. Only safe to inject when no TUI is running yet.
+                try:
+                    await me.session.async_send_text(esc)
+                except Exception:
+                    pass
+                sys.stdout.write(esc)
+                sys.stdout.write(
+                    f"\x1b[1;7;36m  ▌ teammate-mcp ▌  this pane = {label}  \x1b[0m\n"
+                )
+                sys.stdout.flush()
 
             print(f"✓ registered as {label}  (session {me.session_id[:8]}…, "
                   f"job={me.job!r}, cwd={me.cwd})")
-            print(f"  → tab title, window title, and iTerm badge set to "
-                  f"[{label}]")
-            print(f"  → if nothing is visible: iTerm Preferences → "
-                  f"Profile → General → Badge (enable + bright color), "
-                  f"or Appearance → Panes → 'Show titles in tabs / panes'")
             return 0
         finally:
             try:
@@ -182,6 +346,98 @@ def _cmd_unregister(argv: list[str]) -> int:
     from . import registry
     registry.unregister(argv[0])
     print(f"✓ unregistered {argv[0]!r}")
+    return 0
+
+
+def _cmd_whoami() -> int:
+    """Print the label of the calling pane (or "(unregistered)").
+
+    Resolves the calling shell's TERM_SESSION_ID against the registry.
+    Useful inside an agent: "내가 누구야?" → bash → teammate-mcp whoami.
+    """
+    from . import registry
+    tsid = os.environ.get("TERM_SESSION_ID", "")
+    sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+    if not sid_tail:
+        print("(no TERM_SESSION_ID — not running inside iTerm)")
+        return 2
+    for label, rec in registry.all_labels().items():
+        rec_sid = (rec.get("session_id") or "").upper()
+        if rec_sid == sid_tail or rec_sid.endswith(sid_tail) or sid_tail.endswith(rec_sid):
+            print(label)
+            return 0
+    print("(unregistered)")
+    return 1
+
+
+def _cmd_ask(argv: list[str]) -> int:
+    """One-shot ask: send a question to a registered pane, print the answer.
+
+    Usage:
+        teammate-mcp ask <label> <question...>
+        teammate-mcp ask --timeout 60 <label> <question...>
+
+    Reuses the server's `_ask_async` (same code path as the MCP `ask`
+    tool), so per-pane locking, marker matching, and answer extraction
+    all behave identically. Works from a plain bash shell — no MCP
+    server required, which means it's the most reliable path inside a
+    sandboxed agent (codex's bash tool).
+    """
+    timeout = 300
+    args = list(argv)
+    while args and args[0] in ("--timeout", "-t"):
+        args.pop(0)
+        if not args:
+            print("usage: teammate-mcp ask --timeout N <label> <question...>",
+                  file=sys.stderr)
+            return 2
+        try:
+            timeout = int(args.pop(0))
+        except ValueError:
+            print(f"ERROR: --timeout must be an integer", file=sys.stderr)
+            return 2
+    if len(args) < 2:
+        print("usage: teammate-mcp ask <label> <question...>", file=sys.stderr)
+        return 2
+    target = args[0]
+    question = " ".join(args[1:]).strip()
+    if not question:
+        print("ERROR: empty question", file=sys.stderr)
+        return 2
+
+    from .server import _ask_async
+    answer = asyncio.run(_ask_async(question=question, timeout=timeout, target=target))
+    print(answer)
+    if answer.startswith("ERROR:") or answer.startswith("TIMEOUT:"):
+        return 1
+    return 0
+
+
+def _cmd_exists(argv: list[str]) -> int:
+    """Check whether a teammate label exists. Exit 0 if yes, 1 if no.
+
+    Usage: teammate-mcp exists <label>
+    Prints either "yes <label> (session id, job, cwd)" or "no".
+    """
+    if not argv:
+        print("usage: teammate-mcp exists <label>", file=sys.stderr)
+        return 2
+    target = argv[0]
+    from . import registry
+    rec = registry.all_labels().get(target)
+    if rec is None:
+        # Try case-insensitive fallback for ergonomics.
+        for label, r in registry.all_labels().items():
+            if label.lower() == target.lower():
+                rec = r
+                target = label
+                break
+    if rec is None:
+        print(f"no  ({target!r} not in registry)")
+        return 1
+    sid = (rec.get("session_id") or "")[:8]
+    print(f"yes  {target}  (session {sid}…, job={rec.get('job','?')!r}, "
+          f"cwd={rec.get('cwd','?')})")
     return 0
 
 
@@ -273,7 +529,7 @@ def _cmd_install_iterm() -> int:
         "Profiles": [
             {
                 "Name": "Teammate",
-                "Guid": "TEAMMATE-MCP-PROFILE-V1",
+                "Guid": "C9F7E2B4-1A3F-4D89-A0B2-7E5F8C9D1234",
                 "Dynamic Profile Parent Name": "Default",
                 "Show Status Bar": True,
                 "Status Bar Layout": {
@@ -362,6 +618,12 @@ def main():
         sys.exit(_cmd_register_pane(rest))
     if cmd == "list":
         sys.exit(_cmd_list())
+    if cmd == "whoami":
+        sys.exit(_cmd_whoami())
+    if cmd == "exists":
+        sys.exit(_cmd_exists(rest))
+    if cmd == "ask":
+        sys.exit(_cmd_ask(rest))
     if cmd == "unregister":
         sys.exit(_cmd_unregister(rest))
     if cmd == "statusline":

@@ -58,6 +58,22 @@ def _jobname_for(agent: str) -> str:
 
 mcp = FastMCP("teammate")
 _log = get_logger()
+
+# Per-target-pane lock. Only one ask at a time per session — concurrent
+# asks to the same pane interleave on screen, breaking marker extraction
+# (each ask's marker can land between another ask's question + answer).
+# The lock serialises sends; a second ask waits for the first to fully
+# complete before it injects text.
+_pane_locks: dict[str, asyncio.Lock] = {}
+
+
+def _pane_lock(session_id: str) -> asyncio.Lock:
+    sid_key = session_id.upper()
+    lock = _pane_locks.get(sid_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _pane_locks[sid_key] = lock
+    return lock
 _queue = MessageQueue(mode=QUEUE_MODE)
 
 
@@ -133,7 +149,25 @@ async def _ask_async(
     addresses the target session by id directly and is unaffected.
     """
     addressee = target or fallback_agent or "<unspecified>"
-    from_agent = os.environ.get("TEAMMATE_LABEL") or fallback_agent or "unknown"
+    # Resolve `from_agent` in priority order:
+    #   1. explicit env var (TEAMMATE_LABEL) — wrappers may set this
+    #   2. registry lookup by caller's TERM_SESSION_ID — most reliable
+    #      since the MCP subprocess (and any CLI invocation via the
+    #      bash tool) inherits TERM_SESSION_ID from the iTerm shell
+    #   3. fallback_agent — set when caller used ask_codex/ask_claude
+    #   4. "unknown" — last resort
+    from_agent = os.environ.get("TEAMMATE_LABEL", "").strip()
+    if not from_agent:
+        tsid = os.environ.get("TERM_SESSION_ID", "")
+        sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+        if sid_tail:
+            for label, rec in registry.all_labels().items():
+                rec_sid = (rec.get("session_id") or "").upper()
+                if rec_sid == sid_tail or rec_sid.endswith(sid_tail) or sid_tail.endswith(rec_sid):
+                    from_agent = label
+                    break
+    if not from_agent:
+        from_agent = fallback_agent or "unknown"
     msg = _queue.enqueue(from_agent, addressee, question, timeout=timeout)
     _log.event(
         "ask.enqueue",
@@ -166,7 +200,7 @@ async def _ask_async(
             f"longer open in iTerm. Re-register the new pane."
         )
 
-    marker = f"<<DONE_{msg.id}>>"
+    marker = f"tmdone-{msg.id}-end"
     body = (
         f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
         f"{question}\n\n"
@@ -176,30 +210,34 @@ async def _ask_async(
 
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid)
-    try:
-        # Run the (sync) subprocess send in a thread so we don't block
-        # the asyncio loop.
-        await asyncio.to_thread(osa_send_text, sid, body, True)
-    except Exception as e:
-        _queue.fail(msg.id, f"send_text failed: {e!r}")
-        _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
-        return f"ERROR: send_text via osascript failed: {e}"
-    _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
 
-    # min_count=2: the prompt we injected contains the marker; wait for
-    # the SECOND occurrence (the agent's actual reply terminator).
-    screen = await osa_wait_for_marker(
-        sid, marker, timeout=float(timeout), poll_interval=2.0, min_count=2,
-    )
-    if screen is None:
-        _queue.fail(msg.id, "timeout")
-        _log.event("ask.timeout", id=msg.id, timeout=timeout)
-        return f"TIMEOUT: no '{marker}' within {timeout}s"
+    # Serialise per-target-pane: a concurrent ask to the same pane must
+    # wait until this one's marker is detected (or times out). Without
+    # this, two pending asks interleave their question echoes and answer
+    # markers in the screen buffer and `extract_answer` returns the text
+    # of multiple replies fused together.
+    async with _pane_lock(sid):
+        try:
+            await asyncio.to_thread(osa_send_text, sid, body, True)
+        except Exception as e:
+            _queue.fail(msg.id, f"send_text failed: {e!r}")
+            _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
+            return f"ERROR: send_text via osascript failed: {e}"
+        _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
 
-    answer = extract_answer(screen, question, marker)
-    _queue.complete(msg.id, answer)
-    _log.event("ask.complete", id=msg.id, answer_len=len(answer))
-    return answer or "(empty answer)"
+        # min_count=2: prompt echo + agent's reply terminator.
+        screen = await osa_wait_for_marker(
+            sid, marker, timeout=float(timeout), poll_interval=0.5, min_count=2,
+        )
+        if screen is None:
+            _queue.fail(msg.id, "timeout")
+            _log.event("ask.timeout", id=msg.id, timeout=timeout)
+            return f"TIMEOUT: no '{marker}' within {timeout}s"
+
+        answer = extract_answer(screen, question, marker)
+        _queue.complete(msg.id, answer)
+        _log.event("ask.complete", id=msg.id, answer_len=len(answer))
+        return answer or "(empty answer)"
 
 
 # ---------------------------------------------------------------------------

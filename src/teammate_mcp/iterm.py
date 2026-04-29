@@ -42,21 +42,54 @@ def _applescript_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _raise_iterm_window_for_session(session_id: str) -> bool:
+    """Bring the iTerm window containing ``session_id`` to the front.
+
+    Pure AppleScript ``select`` cannot raise a non-frontmost iTerm window;
+    only the iterm2 Python API can. We call it in a one-shot blocking
+    fashion via ``run_until_complete``. Returns True on success.
+    """
+    target_sid = session_id.upper()
+
+    async def _go(connection):
+        app = await iterm2.async_get_app(connection)
+        for w in app.windows:
+            for t in w.tabs:
+                for s in t.sessions:
+                    if s.session_id.upper() == target_sid:
+                        await w.async_activate()
+                        return True
+        return False
+
+    try:
+        result = {"ok": False}
+
+        async def runner(connection):
+            result["ok"] = await _go(connection)
+
+        iterm2.run_until_complete(runner)
+        return result["ok"]
+    except Exception:
+        return False
+
+
 def osa_send_text(session_id: str, text: str, submit: bool = True) -> None:
     """Push ``text`` into the iTerm session whose unique id matches
     ``session_id``, optionally followed by a real Enter keystroke.
 
-    Pure subprocess — no iterm2 lib. Two-step:
+    ZERO-FOCUS SUBMIT
+    -----------------
+    iTerm bracket-paste-wraps multi-byte API sends when the target TUI
+    has bracket-paste mode enabled (``\\e[?2004h``). Inside that envelope,
+    embedded CR/LF are treated as literal characters by raw-mode TUIs
+    (codex / Claude Code via crossterm/Ink), so the prompt sits in the
+    input box without submitting.
 
-    1. AppleScript ``write text ... newline NO`` — drops the prompt
-       text into the pane buffer. iTerm appears to wrap pasted text
-       in bracketed-paste markers, which means embedded CR/LF stay
-       *inside* the buffer rather than triggering submission.
-    2. ``System Events → key code 36`` — fires an actual Return key
-       event at the OS level, which is delivered outside the bracket
-       paste and therefore commits the line. iTerm is activated and
-       the target session selected just for this keystroke; the user
-       experiences a brief focus blip.
+    The trick: send the body in one call, then a *single*-byte ``\\r`` in
+    a SEPARATE call. iTerm does not bracket-paste lone single-byte sends,
+    so the CR arrives outside the paste envelope and the TUI parser
+    treats it as Return → submit. No keyDown, no focus change, no
+    AppleScript ``activate``, no Window-Server interaction at all.
 
     Multi-line / Unicode prompts go through a tempfile so AppleScript
     string escaping is sidestepped.
@@ -69,24 +102,24 @@ def osa_send_text(session_id: str, text: str, submit: bool = True) -> None:
         path = f.name
 
     if submit:
+        # Step 1 + 2 in one osascript invocation: write the body, then
+        # write a *separate* single-byte CR (ASCII 13). iTerm wraps the
+        # body in bracket-paste markers (it's >1 byte), but the lone CR
+        # is sent raw, so the TUI sees Enter outside the paste envelope.
         script = f'''
 set theText to (read POSIX file "{path}" as «class utf8»)
 tell application "iTerm"
-    activate
     repeat with w in windows
         repeat with t in tabs of w
             repeat with s in sessions of t
                 if (unique id of s) is "{session_id}" then
-                    select s
                     tell s to write text theText newline NO
+                    delay 0.05
+                    tell s to write text (ASCII character 13) newline NO
                 end if
             end repeat
         end repeat
     end repeat
-end tell
-delay 0.25
-tell application "System Events"
-    key code 36
 end tell
 '''
     else:

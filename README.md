@@ -162,6 +162,67 @@ pane, Codex respond there, and Claude relay the answer.
 
 ---
 
+## Slash commands (Claude Code)
+
+Two slash commands ship with the repo, in `commands/`. Drop them into
+`~/.claude/commands/` (or `<project>/.claude/commands/`) to use them.
+
+### `/ask <label> <question…>` — fast path
+
+Routes the question to the target pane via the **CLI directly**,
+bypassing the MCP tool. Use this when you already know the label.
+
+```
+/ask claude20 위 코드의 시간복잡도가 어떻게 돼?
+/ask worker  pytest를 실행해줘
+/ask codex1  Python에서 timezone-aware datetime 만드는 가장 좋은 방법?
+```
+
+Why this exists: the MCP tool path (`mcp__teammate__ask`) is correct
+but slow when invoked from Claude Code — Anthropic defers MCP tool
+schemas to a `ToolSearch` lookup (1–3 s extra) and Opus extended
+thinking adds another 10–40 s deciding to route. `/ask` collapses
+that to a single deterministic Bash call.
+
+Empirical comparison on the same physical pane (claude20 → "ack"):
+
+| Path                                 | Round trip |
+|--------------------------------------|------------|
+| Natural language → `mcp__teammate__ask` | 30–80 s   |
+| `/ask claude20 …`                    | 3–6 s     |
+| Plain CLI in shell                   | 2–4 s     |
+
+### `/team-ask <label> <question…>` — MCP path
+
+The original. Goes through `mcp__teammate__ask`. Use when you want
+the tool-call to be visible in the transcript, or when the `ask`
+needs to be part of a larger LLM-mediated workflow.
+
+### Other slash commands
+
+- `/team-register` — alias for `tmclaude` / `tmcodex`. Registers the
+  current pane in the registry.
+- `/team-list` — print all registered panes.
+
+## Natural-language routing
+
+You can also just say it:
+
+```
+claude20에게 안녕이라고 물어봐
+codex1한테 README 검토해달라고 해
+worker에게 빌드 다시 돌려달라고 시켜
+```
+
+The bundled `templates/CLAUDE.md` (drop into `~/.claude/CLAUDE.md`)
+tells Claude to prefer the **Bash CLI** for asks where the user
+already gave an explicit label, and to fall back to
+`mcp__teammate__ask` only when the target is ambiguous (and a
+`list_panes` call is needed first). This keeps natural-language asks
+fast without sacrificing the MCP path's flexibility.
+
+---
+
 ## How it works
 
 ```

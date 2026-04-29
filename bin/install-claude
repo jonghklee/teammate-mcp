@@ -117,6 +117,56 @@ else
     fi
 fi
 
+# ---- 2.5  Install UserPromptSubmit hook (inbox drain) ---------------------
+HOOK_SRC="$REPO_ROOT/hooks/user_prompt_submit_inbox_drain.py"
+CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
+
+if [[ ! -x "$HOOK_SRC" ]]; then
+    echo "→ skip hook: $HOOK_SRC not executable (chmod +x?)"
+elif [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "→ DRY: would create $CLAUDE_SETTINGS with UserPromptSubmit hook"
+    else
+        cat > "$CLAUDE_SETTINGS" <<JSON
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOOK_SRC" }
+        ]
+      }
+    ]
+  }
+}
+JSON
+        echo "→ created $CLAUDE_SETTINGS with UserPromptSubmit hook"
+    fi
+else
+    # Settings file exists — add hook only if not already present.
+    if grep -qF "user_prompt_submit_inbox_drain.py" "$CLAUDE_SETTINGS"; then
+        echo "→ skip: UserPromptSubmit hook already in $CLAUDE_SETTINGS"
+    else
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "→ DRY: would add UserPromptSubmit hook to $CLAUDE_SETTINGS"
+        else
+            backup="${CLAUDE_SETTINGS}.bak.$(date +%s)"
+            cp "$CLAUDE_SETTINGS" "$backup"
+            python3 - "$CLAUDE_SETTINGS" "$HOOK_SRC" <<'PY'
+import json, sys, pathlib
+path, hook = sys.argv[1], sys.argv[2]
+data = json.loads(pathlib.Path(path).read_text())
+data.setdefault("hooks", {})
+ups = data["hooks"].setdefault("UserPromptSubmit", [])
+# UPS shape per Claude Code docs: list of { hooks: [{type,command,...}] }
+ups.append({"hooks": [{"type": "command", "command": hook}]})
+pathlib.Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+            echo "→ added UserPromptSubmit hook to $CLAUDE_SETTINGS (backup: $(basename "$backup"))"
+        fi
+    fi
+fi
+
 # ---- 3. Register MCP server with Claude Code ------------------------------
 if command -v claude >/dev/null 2>&1; then
     if claude mcp list 2>/dev/null | grep -q '^teammate'; then

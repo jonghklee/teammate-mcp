@@ -340,17 +340,32 @@ async def _ask_async(
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
 
-    # Serialise per-target-pane: a concurrent ask to the same pane must
-    # wait until this one's send (and, if wait=True, its marker poll)
-    # completes before another sender injects text.
+    # ── ASYNC PATH: file-only delivery, NO keystroke injection ──────
+    #
+    # Pure mailbox model. The receiver pane runs a UserPromptSubmit
+    # hook (installed by `install-claude`) that scans the inbox/ on
+    # every user prompt and prepends pending messages. This means:
+    #
+    #   • compose-busy bug ELIMINATED — we never type into the pane,
+    #     so user-typed text is never co-submitted with our payload.
+    #   • permission-prompt freeze ELIMINATED — same reason.
+    #   • interactive-bash corruption ELIMINATED — same reason.
+    #
+    # Trade-off: async messages don't appear until the user submits
+    # their next prompt. That's the "email" model the user asked for.
+    if not wait:
+        _queue.complete(msg.id, "")
+        _log.event("ask.queued", id=msg.id, mode="async", delivery="file-only")
+        return f"queued: job_id={msg.id} to {addressee} (async, mailbox file)"
+
+    # ── SYNC PATH (wait=True): keystroke injection + marker poll ────
+    # Per-target-pane lock prevents concurrent asks from interleaving
+    # their question echoes and answer markers in the screen buffer.
     async with _pane_lock(sid):
-        # ── Pre-flight safety gate ─────────────────────────────────────
-        # Refuse to inject keystrokes when the target's last screen
-        # lines look like a permission prompt or interactive REPL —
-        # those are the cases where injection corrupts state and
-        # freezes the target Claude/Codex. The mailbox file is already
-        # written, so the message is recoverable when the user clears
-        # the prompt and target's hook checks the inbox.
+        # Pre-flight safety gate. Refuse when the target's last screen
+        # lines look like a permission prompt or interactive REPL.
+        # The mailbox file is already written so the message is
+        # recoverable.
         safe, danger = await _wait_until_safe(sid, max_wait=safe_max_wait)
         if not safe:
             _queue.fail(msg.id, f"target unsafe: {danger}")
@@ -370,11 +385,6 @@ async def _ask_async(
             _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
             return f"ERROR: send_text via osascript failed: {e}"
         _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
-
-        if not wait:
-            _queue.complete(msg.id, "")
-            _log.event("ask.queued", id=msg.id, mode="async")
-            return f"queued: job_id={msg.id} to {addressee} (async)"
 
         # min_count=2: prompt echo + agent's reply terminator.
         screen = await osa_wait_for_marker(

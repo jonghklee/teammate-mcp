@@ -25,6 +25,7 @@ Usage:
                                 program — no LLM round trip. Run this
                                 BEFORE you launch claude/codex in the
                                 same pane.
+                                Aliases: `register`, `reg`
   teammate-mcp list             print every registered pane
   teammate-mcp whoami           print THIS pane's label (or "(unregistered)")
   teammate-mcp exists LBL       exit 0 if LBL is registered, 1 if not
@@ -725,7 +726,7 @@ def main():
         q = MessageQueue(mode="audit")
         print(json.dumps(q.status(), indent=2))
         return
-    if cmd == "register-pane":
+    if cmd in ("register-pane", "register", "reg"):
         sys.exit(_cmd_register_pane(rest))
     if cmd == "list":
         sys.exit(_cmd_list())

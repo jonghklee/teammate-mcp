@@ -98,15 +98,34 @@ def main() -> int:
         sender = d.get("from_", "unknown")
         body = d.get("body", "")
         jid = d.get("job_id", "")
+        wait = bool(d.get("wait", False))
+        if wait:
+            # Sender is BLOCKED waiting for processed/<job_id>.json to
+            # gain a `terminal.reply` field. mark_processed is mandatory.
+            instr = (
+                f"⚠ This sender is BLOCKED on a sync ask. "
+                f"After composing your answer, you MUST call:\n"
+                f"  mcp__teammate__mark_processed(job_id='{jid}', "
+                f"target='{label}', reply='<your answer>')\n"
+                f"  — or — \n"
+                f"  teammate-mcp ask {sender} \"<your answer>\" --wait  "
+                f"(via Bash)\n"
+                f"Without that, the sender will time out."
+            )
+        else:
+            instr = (
+                f"To reply (async): `mcp__teammate__ask(target='{sender}', "
+                f"question='<reply>', wait=False)` "
+                f"or `teammate-mcp ask {sender} \"<reply>\"` via Bash. "
+                f"After replying, optionally call "
+                f"mcp__teammate__mark_processed(job_id='{jid}', target='{label}', reply='<reply>') "
+                f"to archive."
+            )
         blocks.append(
-            f"[teammate-mcp inbox: ASK from={sender} job_id={jid}]\n"
+            f"[teammate-mcp inbox: ASK from={sender} job_id={jid} "
+            f"mode={'sync (caller blocked)' if wait else 'async'}]\n"
             f"{body}\n"
-            f"(To reply: `mcp__teammate__ask(target='{sender}', "
-            f"question='<reply>', wait=False)` "
-            f"or `teammate-mcp ask {sender} \"<reply>\" --no-wait` via Bash. "
-            f"After replying, optionally call "
-            f"mcp__teammate__mark_processed(job_id='{jid}', target='{label}', reply='<reply>') "
-            f"to archive.)"
+            f"({instr})"
         )
         # Move to processed/ immediately so we don't re-emit on next prompt.
         try:

@@ -340,71 +340,53 @@ async def _ask_async(
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
 
-    # ── ASYNC PATH: file-only delivery, NO keystroke injection ──────
+    # ── UNIFIED FILE-ONLY DELIVERY (v0.8.1) ──────────────────────────
+    # NO keystroke injection in either mode. The compose-merge bug is
+    # eliminated by construction: we never type into the target pane.
     #
-    # Pure mailbox model. The receiver pane runs a UserPromptSubmit
-    # hook (installed by `install-claude`) that scans the inbox/ on
-    # every user prompt and prepends pending messages. This means:
+    # • async (wait=False): write inbox file, return immediately.
+    #   Receiver's UserPromptSubmit hook drains the inbox on its next
+    #   user prompt; receiver replies via reverse async ask.
     #
-    #   • compose-busy bug ELIMINATED — we never type into the pane,
-    #     so user-typed text is never co-submitted with our payload.
-    #   • permission-prompt freeze ELIMINATED — same reason.
-    #   • interactive-bash corruption ELIMINATED — same reason.
-    #
-    # Trade-off: async messages don't appear until the user submits
-    # their next prompt. That's the "email" model the user asked for.
+    # • sync (wait=True): write inbox file, then poll
+    #   ~/.teammate-mcp/mailbox/<target>/processed/<job_id>.json for
+    #   the ``terminal.reply`` field. The receiver's hook prepends the
+    #   ASK to its next user prompt; the receiving LLM is instructed
+    #   (via the hook output) to call mark_processed(job_id, reply=…)
+    #   to set that field. Caller blocks until the field appears or
+    #   timeout elapses. Same compose-safety as async mode.
     if not wait:
         _queue.complete(msg.id, "")
         _log.event("ask.queued", id=msg.id, mode="async", delivery="file-only")
         return f"queued: job_id={msg.id} to {addressee} (async, mailbox file)"
 
-    # ── SYNC PATH (wait=True): keystroke injection + marker poll ────
-    # Per-target-pane lock prevents concurrent asks from interleaving
-    # their question echoes and answer markers in the screen buffer.
-    async with _pane_lock(sid):
-        # Pre-flight safety gate. Refuse when the target's last screen
-        # lines look like a permission prompt or interactive REPL.
-        # The mailbox file is already written so the message is
-        # recoverable.
-        safe, danger = await _wait_until_safe(sid, max_wait=safe_max_wait)
-        if not safe:
-            _queue.fail(msg.id, f"target unsafe: {danger}")
-            _log.event(
-                "ask.unsafe", id=msg.id, danger=danger, session_id=sid,
-            )
-            return (
-                f"REFUSED: target {addressee} appears busy with prompt/dialog "
-                f"({danger!r}). Message {msg.id} was queued to the mailbox "
-                f"and will be picked up when the prompt clears."
-            )
+    # Sync: poll processed/<job_id>.json for the reply.
+    _log.event("ask.send", id=msg.id, to=addressee, session_id=sid, mode="sync-file")
+    processed_path = MAILBOX_ROOT / addressee / "processed" / f"{msg.id}.json"
+    deadline = time.monotonic() + float(timeout)
+    poll = 0.5
+    while time.monotonic() < deadline:
+        if processed_path.exists():
+            try:
+                data = json.loads(processed_path.read_text(encoding="utf-8"))
+                term = data.get("terminal") or {}
+                reply = term.get("reply") or ""
+                _queue.complete(msg.id, reply)
+                _log.event("ask.complete", id=msg.id, answer_len=len(reply),
+                           mode="sync-file")
+                return reply or "(empty answer)"
+            except Exception as e:
+                _log.event("ask.read_error", id=msg.id, error=repr(e))
+                # fall through to retry
+        await asyncio.sleep(poll)
 
-        try:
-            await asyncio.to_thread(osa_send_text, sid, body, True)
-        except Exception as e:
-            _queue.fail(msg.id, f"send_text failed: {e!r}")
-            _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
-            return f"ERROR: send_text via osascript failed: {e}"
-        _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
-
-        # min_count=2: prompt echo + agent's reply terminator.
-        screen = await osa_wait_for_marker(
-            sid, marker, timeout=float(timeout), poll_interval=0.5, min_count=2,
-        )
-        if screen is None:
-            _queue.fail(msg.id, "timeout")
-            _log.event("ask.timeout", id=msg.id, timeout=timeout)
-            return f"TIMEOUT: no '{marker}' within {timeout}s"
-
-        answer = extract_answer(screen, question, marker)
-        _queue.complete(msg.id, answer)
-        _log.event("ask.complete", id=msg.id, answer_len=len(answer))
-        try:
-            _move_to_processed(addressee, msg.id,
-                               {"status": "completed", "reply": answer,
-                                "finished_at": _now_iso()})
-        except Exception:
-            pass
-        return answer or "(empty answer)"
+    _queue.fail(msg.id, "timeout")
+    _log.event("ask.timeout", id=msg.id, timeout=timeout, mode="sync-file")
+    return (
+        f"TIMEOUT: no reply within {timeout}s. Message persisted at "
+        f"~/.teammate-mcp/mailbox/{addressee}/inbox/{msg.id}.json — receiver "
+        f"may still process it later."
+    )
 
 
 # ---------------------------------------------------------------------------

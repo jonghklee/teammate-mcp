@@ -75,6 +75,18 @@ def main() -> int:
     except Exception:
         pass
 
+    # Opportunistic prune of dead registry entries — keeps `list` clean
+    # and recycles claudeN/codexN numbers without manual intervention.
+    # Wrap in broad except so a prune failure never blocks prompt submit.
+    try:
+        repo_src = Path(__file__).resolve().parent.parent / "src"
+        if str(repo_src) not in sys.path:
+            sys.path.insert(0, str(repo_src))
+        from teammate_mcp import registry as _reg  # noqa: E402
+        _reg.prune_dead()  # cached internally; cheap on repeat calls
+    except Exception:
+        pass
+
     label = _resolve_label()
     if not label:
         return 0

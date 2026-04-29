@@ -129,3 +129,68 @@ def lookup(label: str) -> Optional[dict]:
 
 def all_labels() -> dict:
     return load()
+
+
+# Cache of alive iTerm session IDs for prune_dead. Refreshed at most
+# once per ``_PRUNE_TTL`` seconds — querying iTerm via osascript on
+# every all_labels() call is too expensive (we call it from the hook).
+_PRUNE_CACHE: dict = {"sids": frozenset(), "ts": 0.0}
+_PRUNE_TTL = 5.0  # seconds
+
+
+def _alive_session_ids_via_osascript() -> frozenset[str]:
+    """One-shot AppleScript: list every iTerm session UUID currently open."""
+    import subprocess
+    script = '''
+tell application "iTerm"
+    set out to ""
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                set out to out & (unique id of s) & "\n"
+            end repeat
+        end repeat
+    end repeat
+    return out
+end tell
+'''
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            check=True, capture_output=True, text=True, timeout=5,
+        )
+        return frozenset(line.strip().upper() for line in r.stdout.splitlines() if line.strip())
+    except Exception:
+        return frozenset()
+
+
+def prune_dead(force_refresh: bool = False) -> list[str]:
+    """Remove every registry entry whose iTerm session is no longer
+    open. Returns the list of removed labels.
+
+    Cheap: uses a single AppleScript call (≤200ms) cached for
+    ``_PRUNE_TTL`` seconds, so calling this from list/register/lookup
+    paths is fine.
+    """
+    now = time.monotonic()
+    if force_refresh or (now - _PRUNE_CACHE["ts"] > _PRUNE_TTL):
+        _PRUNE_CACHE["sids"] = _alive_session_ids_via_osascript()
+        _PRUNE_CACHE["ts"] = now
+
+    alive = _PRUNE_CACHE["sids"]
+    if not alive:
+        # iTerm not running, or AppleScript failed — don't risk
+        # nuking the registry. No-op.
+        return []
+
+    removed: list[str] = []
+    with _exclusive_lock():
+        data = load()
+        for label, rec in list(data.items()):
+            sid = (rec.get("session_id") or "").strip().upper()
+            if sid and sid not in alive:
+                removed.append(label)
+                data.pop(label, None)
+        if removed:
+            _save_raw(data)
+    return removed

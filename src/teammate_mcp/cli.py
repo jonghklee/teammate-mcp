@@ -36,6 +36,9 @@ Usage:
                                 injection + marker poll).
   teammate-mcp inbox [LBL]      list pending mailbox entries for LBL
                                 (defaults to caller's own pane label)
+  teammate-mcp prune            remove every registry entry whose iTerm
+                                session is no longer open (also auto-runs
+                                inside `list` and `register-pane`)
   teammate-mcp unregister LBL   remove a label from the registry
   teammate-mcp status           print queue status as JSON
   teammate-mcp version          print version
@@ -175,6 +178,14 @@ def _cmd_register_pane(argv: list[str]) -> int:
     if not sid_tail:
         print("ERROR: no TERM_SESSION_ID — are you running inside iTerm?", file=sys.stderr)
         return 2
+
+    # Auto-prune stale entries before this register so dead claudeN/codexN
+    # numbers are recycled instead of monotonically growing.
+    try:
+        from . import registry as _reg
+        _reg.prune_dead(force_refresh=True)
+    except Exception:
+        pass
 
     # ---- Path B: osascript fallback (handles sandboxed callers) -----
     def _register_via_osascript() -> int:
@@ -332,9 +343,14 @@ def _cmd_register_pane(argv: list[str]) -> int:
 
 def _cmd_list() -> int:
     from . import registry
+    # Auto-prune: drop entries whose iTerm session is gone. Cheap
+    # (one AppleScript call, cached for 5 s) so safe to call here.
+    pruned = registry.prune_dead(force_refresh=True)
     panes = registry.all_labels()
     if not panes:
         print("(no panes registered)")
+        if pruned:
+            print(f"  (auto-pruned {len(pruned)} stale entries: {', '.join(sorted(pruned))})")
         return 0
     print(f"{'LABEL':<14} {'JOB':<10} {'SESSION':<10} CWD")
     for label, rec in sorted(panes.items()):
@@ -342,6 +358,24 @@ def _cmd_list() -> int:
               f"{(rec.get('job') or '?'):<10} "
               f"{(rec.get('session_id') or '?')[:8]:<10} "
               f"{rec.get('cwd') or ''}")
+    if pruned:
+        print(f"\n(auto-pruned {len(pruned)} stale entries: {', '.join(sorted(pruned))})")
+    return 0
+
+
+def _cmd_prune() -> int:
+    """Explicit prune — remove every registry entry whose iTerm session
+    is no longer open in iTerm. Same logic as the auto-prune that runs
+    on `list` and `register-pane`.
+    """
+    from . import registry
+    removed = registry.prune_dead(force_refresh=True)
+    if not removed:
+        print("(nothing to prune — all registered panes still live)")
+        return 0
+    print(f"✓ pruned {len(removed)} stale entries:")
+    for label in sorted(removed):
+        print(f"  - {label}")
     return 0
 
 
@@ -695,6 +729,8 @@ def main():
         sys.exit(_cmd_register_pane(rest))
     if cmd == "list":
         sys.exit(_cmd_list())
+    if cmd == "prune":
+        sys.exit(_cmd_prune())
     if cmd == "whoami":
         sys.exit(_cmd_whoami())
     if cmd == "exists":

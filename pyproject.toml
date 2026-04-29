@@ -1,6 +1,6 @@
 [project]
 name = "teammate-mcp"
-version = "0.8.2"
+version = "0.8.3"
 description = "Inter-agent Q&A MCP server: let Claude Code and Codex CLI ask each other questions through your iTerm panes."
 readme = "README.md"
 requires-python = ">=3.11"

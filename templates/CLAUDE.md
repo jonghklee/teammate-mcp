@@ -14,7 +14,20 @@ If sibling iTerm panes are running other agents, you may call:
   session name (the title editable with `cmd+I`), or a session-id
   prefix.
 - `mcp__teammate__list_panes()` — see every live pane plus its
-  label/name/id/job/cwd. Use this when unsure who to address.
+  label/name/id/job/cwd.
+  **DO NOT call this routinely.** It is a disambiguate-only tool
+  that is expensive (deferred MCP schema load + remote call ≈ 1-3 s).
+  Skip it entirely when:
+  - the user already named the target label ("claude29에게 …",
+    "codex1한테 …", "/ask claude20 …"),
+  - you saw the registry in this turn or the previous turn,
+  - you are about to call `ask` and you already have a plausible
+    label string.
+  Call it ONLY when the label is genuinely ambiguous ("옆 페인",
+  "다른 agent", "worker 누군지 모르겠어"). The CLI alternative
+  ``teammate-mcp list`` is ~10× faster (~200 ms vs 1-3 s) when
+  the LLM truly needs to inspect the registry — prefer Bash over
+  the MCP tool whenever you have to look at the list.
 - `mcp__teammate__broadcast(message, targets=[...])` — fire-and-forget
   to one or more panes.
 - `mcp__teammate__register_self(label)` — attach a label to your own

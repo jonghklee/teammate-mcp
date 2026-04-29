@@ -33,7 +33,17 @@ fi
 
 START_WORD="${1:-사과}"
 ROUNDS="${2:-6}"
-LABELS=(a b c)
+# Labels can be overridden via env (LABELS="x y z") or extra args
+# (./wordchain_test.sh "사과" 4 x y z). Default a/b/c kept for the
+# common explicit-TEAMMATE_LABEL setup; for auto-registered panes
+# pass the real labels in.
+if [[ -n "${LABELS:-}" ]]; then
+    read -r -a LABELS <<< "$LABELS"
+elif [[ "$#" -ge 3 ]]; then
+    LABELS=("$3" "$4" "$5")
+else
+    LABELS=(a b c)
+fi
 
 # 자기 라벨 resolve (답장은 SELF의 inbox로 옴)
 SELF="${TEAMMATE_LABEL:-}"
@@ -73,6 +83,15 @@ INBOX_SELF="$HOME/.teammate-mcp/mailbox/$SELF/inbox"
 mkdir -p "$INBOX_SELF"
 rm -f "$INBOX_SELF"/*.json 2>/dev/null || true
 
+# Pause the hook while we run — otherwise caller pane's
+# UserPromptSubmit hook drains files we are polling for, and the
+# polling loop times out before it ever sees them. Hook re-enables
+# automatically on script exit (trap rm).
+LOCK="$HOME/.teammate-mcp/hook-pause.lock"
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+trap 'rm -f "$LOCK"' EXIT INT TERM
+
 # 라운드 진행: word 가 LABELS[i] → LABELS[(i+1)%3] 으로 흐름
 word="$START_WORD"
 fails=0
@@ -95,16 +114,21 @@ for r in $(seq 1 "$ROUNDS"); do
     # SELF 의 inbox에 receiver 가 답장 도착할 때까지 대기 (max 60s)
     deadline=$(( $(date +%s) + 180 ))
     reply=""
+    PROCESSED_SELF="$HOME/.teammate-mcp/mailbox/$SELF/processed"
+    mkdir -p "$PROCESSED_SELF"
+    # caller pane's UserPromptSubmit hook may drain inbox→processed
+    # within milliseconds of arrival, so we poll BOTH dirs.
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        # 가장 최근 inbox 파일 중 from=$receiver 인 것 찾기
-        for f in "$INBOX_SELF"/*.json; do
-            [ -f "$f" ] || continue
-            from=$(python3 -c "import json,sys; print(json.load(open('$f')).get('from_',''))" 2>/dev/null)
-            if [ "$from" = "$receiver" ]; then
-                reply=$(python3 -c "import json,sys; print(json.load(open('$f')).get('body','').strip())" 2>/dev/null)
-                rm -f "$f"  # 다음 라운드를 위해 청소
-                break
-            fi
+        for dir in "$INBOX_SELF" "$PROCESSED_SELF"; do
+            for f in "$dir"/*.json; do
+                [ -f "$f" ] || continue
+                from=$(python3 -c "import json,sys; print(json.load(open('$f')).get('from_',''))" 2>/dev/null)
+                if [ "$from" = "$receiver" ]; then
+                    reply=$(python3 -c "import json,sys; print(json.load(open('$f')).get('body','').strip())" 2>/dev/null)
+                    rm -f "$f"  # 다음 라운드를 위해 청소
+                    break 2
+                fi
+            done
         done
         [ -n "$reply" ] && break
         sleep 1

@@ -75,6 +75,15 @@ def main() -> int:
     except Exception:
         pass
 
+    # Pause hook entirely while a script holds the wordchain / batch
+    # lock — otherwise the hook would drain the inbox out from under
+    # the polling script, and the script would think the message
+    # never arrived. Test scripts touch this file before the run and
+    # ``rm`` it on exit (trap'd).
+    LOCK = Path.home() / ".teammate-mcp" / "hook-pause.lock"
+    if LOCK.exists():
+        return 0
+
     # Opportunistic prune of dead registry entries — keeps `list` clean
     # and recycles claudeN/codexN numbers without manual intervention.
     # Wrap in broad except so a prune failure never blocks prompt submit.

@@ -147,6 +147,74 @@ end tell
             pass
 
 
+def osa_send_raw(session_id: str, raw_bytes: str) -> None:
+    """Send a literal short byte string (e.g. ESC ESC + Ctrl+U) to the
+    session WITHOUT bracket-paste wrapping. iTerm's `write text … newline NO`
+    sends the bytes raw when called with a small payload. Used to clear
+    Claude Code's compose box (ESC ESC) and the current input line
+    (Ctrl+U).
+    """
+    # AppleScript can't represent arbitrary control bytes in a string
+    # literal cleanly, so we tempfile.
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".tmm") as f:
+        f.write(raw_bytes.encode("utf-8"))
+        path = f.name
+    script = f'''
+set theText to (read POSIX file "{path}" as «class utf8»)
+tell application "iTerm"
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if (unique id of s) is "{session_id}" then
+                    tell s to write text theText newline NO
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell
+'''
+    try:
+        subprocess.run(["osascript", "-e", script], check=True,
+                       capture_output=True, text=True, timeout=10)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# Match the Claude Code compose prompt line. Examples seen on real panes:
+#   "  ❯ user typed text here"
+#   "  ❯ "         (empty)
+# We allow leading whitespace before ❯, and capture everything after the
+# `❯ ` prompt up to end-of-line.
+_COMPOSE_LINE_RE = re.compile(r"^\s*❯\s?(.*)$")
+
+
+def osa_extract_compose(session_id: str) -> str:
+    """Best-effort extraction of the user's typed-but-unsubmitted text
+    from a Claude Code session's compose box.
+
+    Returns the text after the last visible "❯ " prompt on screen,
+    stripped of trailing whitespace and null padding. Empty string if
+    no match (or compose appears empty).
+    """
+    screen = osa_capture(session_id)
+    if not screen:
+        return ""
+    # Inspect the last 30 lines (compose lives near the bottom).
+    for line in reversed(screen.splitlines()[-30:]):
+        m = _COMPOSE_LINE_RE.match(line)
+        if not m:
+            continue
+        rest = m.group(1)
+        # Strip ANSI residues, NULs, trailing spaces.
+        rest = strip_ansi(rest).rstrip(" \x00")
+        return rest
+    return ""
+
+
 def osa_capture(session_id: str) -> str:
     """Return the visible buffer of an iTerm session via AppleScript.
 

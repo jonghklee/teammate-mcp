@@ -35,6 +35,8 @@ from .iterm import (
     find_session_by_job,
     get_screen,
     osa_capture,
+    osa_extract_compose,
+    osa_send_raw,
     osa_send_text,
     osa_session_alive,
     osa_wait_for_marker,
@@ -375,67 +377,84 @@ async def _ask_async(
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
 
-    # ── UNIFIED FILE-ONLY DELIVERY (v0.8.1) ──────────────────────────
-    # NO keystroke injection in either mode. The compose-merge bug is
-    # eliminated by construction: we never type into the target pane.
-    #
-    # • async (wait=False): write inbox file, return immediately.
-    #   Receiver's UserPromptSubmit hook drains the inbox on its next
-    #   user prompt; receiver replies via reverse async ask.
-    #
-    # • sync (wait=True): write inbox file, then poll
-    #   ~/.teammate-mcp/mailbox/<target>/processed/<job_id>.json for
-    #   the ``terminal.reply`` field. The receiver's hook prepends the
-    #   ASK to its next user prompt; the receiving LLM is instructed
-    #   (via the hook output) to call mark_processed(job_id, reply=…)
-    #   to set that field. Caller blocks until the field appears or
-    #   timeout elapses. Same compose-safety as async mode.
+    # ── v0.10.0 LEGACY-FIRST DELIVERY ──────────────────────────────
+    # Restore the v0.6 directly-injected keystroke path, but bracket
+    # it with compose save & restore so user-typed text isn't lost:
+    #   1. snapshot the receiver's compose box
+    #   2. ESC ESC + Ctrl+U to clear (Claude Code's own clear sequence)
+    #   3. inject body via osascript + lone CR (the v0.6 path)
+    #   4. background task: 2 s later, type the saved text back into compose
+    #   5. delete the inbox file iff keystroke succeeded so the receiver's
+    #      hook (if any) doesn't double-deliver. If keystroke failed,
+    #      the inbox file remains and the hook acts as fallback.
+    saved_compose = ""
+    delivered_via_keystroke = False
+    try:
+        saved_compose = await asyncio.to_thread(osa_extract_compose, sid)
+        if saved_compose:
+            _log.event("ask.compose_snapshot", id=msg.id,
+                       saved_len=len(saved_compose),
+                       preview=saved_compose[:40])
+            try:
+                await asyncio.to_thread(osa_send_raw, sid, "\x1b\x1b\x15")
+                await asyncio.sleep(0.08)
+            except Exception as e:
+                _log.event("ask.compose_clear_failed",
+                           id=msg.id, error=repr(e))
+        await asyncio.to_thread(osa_send_text, sid, body, True)
+        delivered_via_keystroke = True
+        _log.event("ask.send", id=msg.id, to=addressee, session_id=sid,
+                   mode="legacy-keystroke",
+                   restoring=bool(saved_compose))
+        if saved_compose:
+            # Restore INLINE (not asyncio.create_task) — when ``ask``
+            # is invoked via the CLI, ``asyncio.run`` exits the moment
+            # this coroutine returns and any pending background tasks
+            # get cancelled before they can run. We block the caller
+            # for ~2 s instead, which is the same window the receiver
+            # needs to commit our submit anyway.
+            await asyncio.sleep(2.0)
+            try:
+                await asyncio.to_thread(
+                    osa_send_text, sid, saved_compose, False,
+                )
+                _log.event("ask.compose_restored", id=msg.id,
+                           restored_len=len(saved_compose))
+            except Exception as e:
+                _log.event("ask.restore_failed",
+                           id=msg.id, error=repr(e))
+    except Exception as e:
+        _log.event("ask.send_failed_falling_back_to_file",
+                   id=msg.id, error=repr(e))
+
+    if delivered_via_keystroke:
+        try:
+            (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
+                missing_ok=True,
+            )
+        except Exception:
+            pass
+
     if not wait:
-        # Optional best-effort keystroke wake for receivers that don't
-        # have the v0.7+ UserPromptSubmit hook installed (e.g. Codex
-        # panes, legacy Claude Code sessions started before
-        # ``install-claude`` ran). The user opts in via the env var
-        # ``TEAMMATE_INJECT=1`` because the wake re-introduces the
-        # compose-merge risk for whichever pane it lands on; absent
-        # the env var, async stays purely file-only.
-        if os.environ.get("TEAMMATE_INJECT", "").strip() in ("1", "true", "yes"):
-            try:
-                if osa_session_alive(sid):
-                    await asyncio.to_thread(osa_send_text, sid, body, True)
-                    _log.event("ask.legacy_inject", id=msg.id, to=addressee, session_id=sid)
-            except Exception as e:
-                _log.event("ask.legacy_inject_failed", id=msg.id, error=repr(e))
         _queue.complete(msg.id, "")
-        _log.event("ask.queued", id=msg.id, mode="async", delivery="file-only")
-        return f"queued: job_id={msg.id} to {addressee} (async, mailbox file)"
+        return (f"sent: job_id={msg.id} to {addressee} "
+                f"({'keystroke' if delivered_via_keystroke else 'file-fallback'})")
 
-    # Sync: poll processed/<job_id>.json for the reply.
-    _log.event("ask.send", id=msg.id, to=addressee, session_id=sid, mode="sync-file")
-    processed_path = MAILBOX_ROOT / addressee / "processed" / f"{msg.id}.json"
-    deadline = time.monotonic() + float(timeout)
-    poll = 0.5
-    while time.monotonic() < deadline:
-        if processed_path.exists():
-            try:
-                data = json.loads(processed_path.read_text(encoding="utf-8"))
-                term = data.get("terminal") or {}
-                reply = term.get("reply") or ""
-                _queue.complete(msg.id, reply)
-                _log.event("ask.complete", id=msg.id, answer_len=len(reply),
-                           mode="sync-file")
-                return reply or "(empty answer)"
-            except Exception as e:
-                _log.event("ask.read_error", id=msg.id, error=repr(e))
-                # fall through to retry
-        await asyncio.sleep(poll)
-
-    _queue.fail(msg.id, "timeout")
-    _log.event("ask.timeout", id=msg.id, timeout=timeout, mode="sync-file")
-    return (
-        f"TIMEOUT: no reply within {timeout}s. Message persisted at "
-        f"~/.teammate-mcp/mailbox/{addressee}/inbox/{msg.id}.json — receiver "
-        f"may still process it later."
+    # Sync: poll the receiver's screen for the marker (v0.6 path).
+    screen = await osa_wait_for_marker(
+        sid, marker, timeout=float(timeout),
+        poll_interval=0.5, min_count=2,
     )
+    if screen is None:
+        _queue.fail(msg.id, "timeout")
+        _log.event("ask.timeout", id=msg.id, timeout=timeout,
+                   mode="legacy-marker")
+        return f"TIMEOUT: no '{marker}' within {timeout}s"
+    answer = extract_answer(screen, question, marker)
+    _queue.complete(msg.id, answer)
+    _log.event("ask.complete", id=msg.id, answer_len=len(answer),
+               mode="legacy-marker")
+    return answer or "(empty answer)"
 
 
 # ---------------------------------------------------------------------------

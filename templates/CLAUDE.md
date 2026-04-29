@@ -103,5 +103,36 @@ After the CLI/tool returns, print the answer back to the user verbatim
 If the user explicitly types `/ask <label> <question…>`, follow the
 slash command spec — do not second-guess.
 
+### Receiving an async ASK (mailbox / email mode)
+
+When you see an injected message that looks like::
+
+    [teammate-mcp ASK <job_id> from=<sender> mode=async]
+    <body>
+
+    Reply when you can by calling:
+    `teammate-mcp ask <sender> "<your reply>" --no-wait`
+
+You handle it the same way you'd handle a normal user prompt, then
+**send the reply back via a reverse async ask** so the original sender
+isn't blocked. Concretely:
+
+1. Compose your answer.
+2. Call `mcp__teammate__ask(target=<sender>, question=<answer>, wait=False)`,
+   or run `teammate-mcp ask <sender> "<answer>" --no-wait` via Bash.
+3. Optionally call `mcp__teammate__mark_processed(job_id=<job_id>, reply=<answer>)`
+   to move the message from the inbox/ to processed/ on your mailbox.
+
+Never wait for the receiver of your reply to acknowledge — that would
+re-introduce the very synchronous coupling the async mode is designed
+to eliminate.
+
+### Draining your inbox
+
+If the user asks you to "check the inbox", "drain pending mail", or
+"check for messages", call `mcp__teammate__inbox()` (no args — it
+defaults to your own label). For each entry, decide whether to reply
+(usually yes) and follow the receiving-async-ASK flow above.
+
 Project: <https://github.com/jonghklee/teammate-mcp>
 <!-- TEAMMATE_MCP_END -->

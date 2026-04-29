@@ -15,10 +15,13 @@ marker, polls for the marker, then returns the extracted answer.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 import iterm2
@@ -46,6 +49,98 @@ from . import registry
 # Configurable through env so users can flip audit mode without code edits.
 QUEUE_MODE = os.environ.get("TEAMMATE_QUEUE_MODE", "ephemeral")
 PROJECT_CWD = os.environ.get("TEAMMATE_CWD") or os.getcwd()
+
+# Mailbox root — daemonless persistent queue (CCB-style serial-per-agent
+# inbox/processed directories).
+MAILBOX_ROOT = Path.home() / ".teammate-mcp" / "mailbox"
+
+
+# Pre-flight danger patterns. If we see any of these in the last few
+# screen lines of the target pane, we refuse to inject keystrokes
+# (until the prompt clears or a max-wait elapses). This prevents the
+# "session freeze" failure mode where our injected text gets eaten by
+# a permission prompt or an interactive bash command.
+DANGER_PATTERNS = [
+    # Claude Code permission menu
+    "❯ 1.", "❯ 2.", "❯ 3.",
+    "Do you want to allow",
+    "Allow this command",
+    # generic confirms
+    "(y/n)", "(Y/n)", "(y/N)", "[y/N]", "[Y/n]",
+    "Press Y to confirm", "Press Enter to continue",
+    # interactive auth
+    "Password:", "password:", "passphrase:",
+    # shell-running interactive REPLs we shouldn't disturb
+    ">>> ",  # python REPL prompt
+]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _mailbox_dir(label: str, sub: str) -> Path:
+    p = MAILBOX_ROOT / label / sub
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _write_inbox(target_label: str, record: dict) -> Path:
+    """Atomically write a job record into <target>'s inbox/."""
+    inbox = _mailbox_dir(target_label, "inbox")
+    final = inbox / f"{record['job_id']}.json"
+    tmp = inbox / f".{record['job_id']}.json.tmp"
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(final)
+    return final
+
+
+def _move_to_processed(target_label: str, job_id: str, terminal: dict) -> None:
+    src = _mailbox_dir(target_label, "inbox") / f"{job_id}.json"
+    dst = _mailbox_dir(target_label, "processed") / f"{job_id}.json"
+    if src.exists():
+        try:
+            data = json.loads(src.read_text(encoding="utf-8"))
+        except Exception:
+            data = {"job_id": job_id}
+        data["terminal"] = terminal
+        dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        src.unlink(missing_ok=True)
+
+
+def _list_inbox(label: str) -> list[dict]:
+    inbox = _mailbox_dir(label, "inbox")
+    out = []
+    for p in sorted(inbox.glob("*.json")):
+        try:
+            out.append(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return out
+
+
+async def _wait_until_safe(sid: str, max_wait: float = 30.0) -> tuple[bool, Optional[str]]:
+    """Poll the target pane's last screen lines for danger patterns.
+
+    Returns (safe, last_danger_pattern). If safe=True, danger=None.
+    If max_wait elapses with the pane still in a danger state,
+    returns (False, <pattern>). Callers can then either refuse to
+    inject (raise an error to the user) or queue without injecting
+    (target reads from inbox file later).
+    """
+    deadline = time.monotonic() + max_wait
+    last_danger: Optional[str] = None
+    while time.monotonic() < deadline:
+        try:
+            screen = await asyncio.to_thread(osa_capture, sid)
+        except Exception:
+            screen = ""
+        tail = "\n".join((screen or "").splitlines()[-8:])
+        last_danger = next((p for p in DANGER_PATTERNS if p in tail), None)
+        if last_danger is None:
+            return True, None
+        await asyncio.sleep(1.0)
+    return False, last_danger
 
 
 def _jobname_for(agent: str) -> str:
@@ -140,13 +235,21 @@ async def _ask_async(
     timeout: int,
     target: str = "",
     fallback_agent: Optional[str] = None,
+    wait: bool = True,
+    safe_max_wait: float = 30.0,
 ) -> str:
-    """Drive one ask: enqueue → push (osascript) → wait (osascript) → return.
+    """Drive one ask: enqueue → push (osascript) → [optionally wait] → return.
 
-    Bypasses the iterm2 Python library entirely on the hot path because
-    `async_get_app(connection)` and per-session variable queries can
-    hang on desktops with many panes. AppleScript via `osascript`
-    addresses the target session by id directly and is unaffected.
+    If ``wait`` is True (default for backwards compat), polls the target's
+    screen for the completion marker and returns the extracted answer.
+    If ``wait`` is False, returns immediately after injecting the message,
+    with shape ``"queued: job_id=<id> to <target>"``. The target is
+    instructed (via the prompt body) to reply via a reverse ``ask`` —
+    the email-style mailbox model.
+
+    Either way, the message is persisted to
+    ``~/.teammate-mcp/mailbox/<target>/inbox/<job_id>.json`` so that an
+    audit trail and recovery path always exist.
     """
     addressee = target or fallback_agent or "<unspecified>"
     # Resolve `from_agent` in priority order:
@@ -200,23 +303,66 @@ async def _ask_async(
             f"longer open in iTerm. Re-register the new pane."
         )
 
+    # Persist to <target>'s inbox BEFORE attempting injection, so the
+    # message is never lost — even if injection is refused due to a
+    # danger prompt, the target can pick it up via /inbox or a hook.
+    inbox_record = {
+        "job_id": msg.id,
+        "from_": from_agent,
+        "to": addressee,
+        "body": question,
+        "wait": bool(wait),
+        "created_at": _now_iso(),
+        "status": "queued",
+    }
+    try:
+        _write_inbox(addressee, inbox_record)
+    except Exception as e:
+        _log.event("ask.inbox_write_failed", id=msg.id, error=repr(e))
+
     marker = f"tmdone-{msg.id}-end"
-    body = (
-        f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
-        f"{question}\n\n"
-        f"When you finish, output exactly this marker on its own line:\n"
-        f"{marker}\n"
-    )
+    if wait:
+        body = (
+            f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
+            f"{question}\n\n"
+            f"When you finish, output exactly this marker on its own line:\n"
+            f"{marker}\n"
+        )
+    else:
+        body = (
+            f"[teammate-mcp ASK {msg.id} from={from_agent} mode=async]\n"
+            f"{question}\n\n"
+            f"Reply when you can by calling: "
+            f"`teammate-mcp ask {from_agent} \"<your reply>\" --no-wait`\n"
+            f"(no marker required; the sender is not blocked).\n"
+        )
 
     _queue.claim(msg.id)
-    _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid)
+    _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
 
     # Serialise per-target-pane: a concurrent ask to the same pane must
-    # wait until this one's marker is detected (or times out). Without
-    # this, two pending asks interleave their question echoes and answer
-    # markers in the screen buffer and `extract_answer` returns the text
-    # of multiple replies fused together.
+    # wait until this one's send (and, if wait=True, its marker poll)
+    # completes before another sender injects text.
     async with _pane_lock(sid):
+        # ── Pre-flight safety gate ─────────────────────────────────────
+        # Refuse to inject keystrokes when the target's last screen
+        # lines look like a permission prompt or interactive REPL —
+        # those are the cases where injection corrupts state and
+        # freezes the target Claude/Codex. The mailbox file is already
+        # written, so the message is recoverable when the user clears
+        # the prompt and target's hook checks the inbox.
+        safe, danger = await _wait_until_safe(sid, max_wait=safe_max_wait)
+        if not safe:
+            _queue.fail(msg.id, f"target unsafe: {danger}")
+            _log.event(
+                "ask.unsafe", id=msg.id, danger=danger, session_id=sid,
+            )
+            return (
+                f"REFUSED: target {addressee} appears busy with prompt/dialog "
+                f"({danger!r}). Message {msg.id} was queued to the mailbox "
+                f"and will be picked up when the prompt clears."
+            )
+
         try:
             await asyncio.to_thread(osa_send_text, sid, body, True)
         except Exception as e:
@@ -224,6 +370,11 @@ async def _ask_async(
             _log.event("ask.fail", id=msg.id, reason="send_failed", error=repr(e))
             return f"ERROR: send_text via osascript failed: {e}"
         _log.event("ask.send", id=msg.id, to=addressee, session_id=sid)
+
+        if not wait:
+            _queue.complete(msg.id, "")
+            _log.event("ask.queued", id=msg.id, mode="async")
+            return f"queued: job_id={msg.id} to {addressee} (async)"
 
         # min_count=2: prompt echo + agent's reply terminator.
         screen = await osa_wait_for_marker(
@@ -237,6 +388,12 @@ async def _ask_async(
         answer = extract_answer(screen, question, marker)
         _queue.complete(msg.id, answer)
         _log.event("ask.complete", id=msg.id, answer_len=len(answer))
+        try:
+            _move_to_processed(addressee, msg.id,
+                               {"status": "completed", "reply": answer,
+                                "finished_at": _now_iso()})
+        except Exception:
+            pass
         return answer or "(empty answer)"
 
 
@@ -245,8 +402,8 @@ async def _ask_async(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def ask(question: str, target: str = "", timeout: int = 300) -> str:
-    """Ask another pane a question and return its answer.
+async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = True) -> str:
+    """Ask another pane a question.
 
     ``target`` may be:
       * a registered label (set via ``TEAMMATE_LABEL`` env or
@@ -254,6 +411,16 @@ async def ask(question: str, target: str = "", timeout: int = 300) -> str:
       * an iTerm session name (the title users edit with ``cmd+I``,
         case-insensitive exact match),
       * a session UUID prefix (≥ 6 chars).
+
+    ``wait``:
+      * ``True`` (default, sync): inject the message and poll the
+        target's screen for a completion marker. Returns the answer,
+        or TIMEOUT after ``timeout`` seconds.
+      * ``False`` (async / fire-and-forget mailbox model): inject the
+        message, persist to ``~/.teammate-mcp/mailbox/<target>/inbox/``,
+        return immediately with ``"queued: job_id=… to …"``. The target
+        is instructed to reply via a reverse async ``ask``. Use this
+        when you don't want the caller blocked.
 
     When ``target`` is empty the caller's job name is used: a Claude
     caller falls back to "codex" and vice versa, preserving the v0.1
@@ -264,7 +431,71 @@ async def ask(question: str, target: str = "", timeout: int = 300) -> str:
         # We don't actually know which CLI is calling — let MCP decide
         # from the legacy aliases below.
         fallback = None
-    return await _ask_async(question, timeout, target=target, fallback_agent=fallback)
+    return await _ask_async(question, timeout, target=target,
+                            fallback_agent=fallback, wait=wait)
+
+
+@mcp.tool()
+async def inbox(label: str = "") -> list[dict]:
+    """List queued (unprocessed) messages in a pane's inbox.
+
+    If ``label`` is empty, uses the caller's own label (resolved via
+    TEAMMATE_LABEL env or by matching TERM_SESSION_ID against the
+    registry).
+
+    Each entry has the shape::
+
+        {
+          "job_id":    "1777…",
+          "from_":     "claude4",
+          "to":        "claude20",
+          "body":      "<question text>",
+          "wait":      true | false,
+          "created_at": "2026-04-29T05:30:12Z",
+          "status":    "queued"
+        }
+
+    Use this from a receiver pane to drain pending mail when you are
+    idle — process each entry and reply via ``ask(target=<from_>,
+    question=<reply>, wait=False)``.
+    """
+    label = label.strip()
+    if not label:
+        # Resolve caller label
+        label = os.environ.get("TEAMMATE_LABEL", "").strip()
+        if not label:
+            tsid = os.environ.get("TERM_SESSION_ID", "")
+            sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+            for lbl, rec in registry.all_labels().items():
+                rec_sid = (rec.get("session_id") or "").upper()
+                if rec_sid == sid_tail or (sid_tail and rec_sid.endswith(sid_tail)):
+                    label = lbl
+                    break
+        if not label:
+            return [{"error": "no caller label resolvable"}]
+    return _list_inbox(label)
+
+
+@mcp.tool()
+async def mark_processed(job_id: str, target: str = "", reply: str = "") -> str:
+    """Move a job from inbox/ to processed/ on the target's mailbox.
+
+    Call this from the receiver after you've replied (or otherwise
+    handled) the message. ``target`` defaults to the caller's own
+    label. ``reply`` is stored in the processed record so callers
+    waiting via ``watch`` can read it.
+    """
+    if not target:
+        target = os.environ.get("TEAMMATE_LABEL", "").strip()
+    if not target:
+        return "ERROR: no target label"
+    try:
+        _move_to_processed(target, job_id,
+                           {"status": "completed", "reply": reply,
+                            "finished_at": _now_iso()})
+        return f"ok: {job_id} moved to processed"
+    except Exception as e:
+        return f"ERROR: {e!r}"
 
 
 @mcp.tool()

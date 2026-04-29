@@ -29,7 +29,10 @@ Usage:
   teammate-mcp whoami           print THIS pane's label (or "(unregistered)")
   teammate-mcp exists LBL       exit 0 if LBL is registered, 1 if not
   teammate-mcp ask LBL Q...     ask LBL the question Q, print the answer
-                                (--timeout N to override default 300s)
+                                (--timeout N to override default 300s,
+                                 --no-wait for async / fire-and-forget mailbox mode)
+  teammate-mcp inbox [LBL]      list pending mailbox entries for LBL
+                                (defaults to caller's own pane label)
   teammate-mcp unregister LBL   remove a label from the registry
   teammate-mcp status           print queue status as JSON
   teammate-mcp version          print version
@@ -371,33 +374,47 @@ def _cmd_whoami() -> int:
 
 
 def _cmd_ask(argv: list[str]) -> int:
-    """One-shot ask: send a question to a registered pane, print the answer.
+    """One-shot ask: send a question to a registered pane.
 
     Usage:
         teammate-mcp ask <label> <question...>
         teammate-mcp ask --timeout 60 <label> <question...>
+        teammate-mcp ask --no-wait <label> <question...>     # mailbox / fire-and-forget
+
+    Flags:
+        --timeout N    sync timeout in seconds (default 300; ignored with --no-wait)
+        --no-wait      async mailbox mode — inject + persist to inbox + return immediately
+                       with "queued: job_id=… to <label>". Target replies via reverse ask.
+        -t N           alias for --timeout
 
     Reuses the server's `_ask_async` (same code path as the MCP `ask`
-    tool), so per-pane locking, marker matching, and answer extraction
-    all behave identically. Works from a plain bash shell — no MCP
-    server required, which means it's the most reliable path inside a
-    sandboxed agent (codex's bash tool).
+    tool).
     """
     timeout = 300
+    wait = True
     args = list(argv)
-    while args and args[0] in ("--timeout", "-t"):
-        args.pop(0)
-        if not args:
-            print("usage: teammate-mcp ask --timeout N <label> <question...>",
-                  file=sys.stderr)
-            return 2
-        try:
-            timeout = int(args.pop(0))
-        except ValueError:
-            print(f"ERROR: --timeout must be an integer", file=sys.stderr)
+    while args and args[0].startswith("-"):
+        flag = args.pop(0)
+        if flag in ("--timeout", "-t"):
+            if not args:
+                print("usage: teammate-mcp ask --timeout N <label> <question...>",
+                      file=sys.stderr)
+                return 2
+            try:
+                timeout = int(args.pop(0))
+            except ValueError:
+                print(f"ERROR: --timeout must be an integer", file=sys.stderr)
+                return 2
+        elif flag in ("--no-wait", "--async"):
+            wait = False
+        elif flag in ("--wait",):
+            wait = True
+        else:
+            print(f"ERROR: unknown flag {flag!r}", file=sys.stderr)
             return 2
     if len(args) < 2:
-        print("usage: teammate-mcp ask <label> <question...>", file=sys.stderr)
+        print("usage: teammate-mcp ask [--timeout N] [--no-wait] <label> <question...>",
+              file=sys.stderr)
         return 2
     target = args[0]
     question = " ".join(args[1:]).strip()
@@ -406,10 +423,49 @@ def _cmd_ask(argv: list[str]) -> int:
         return 2
 
     from .server import _ask_async
-    answer = asyncio.run(_ask_async(question=question, timeout=timeout, target=target))
+    answer = asyncio.run(_ask_async(question=question, timeout=timeout,
+                                     target=target, wait=wait))
     print(answer)
-    if answer.startswith("ERROR:") or answer.startswith("TIMEOUT:"):
+    if answer.startswith("ERROR:") or answer.startswith("TIMEOUT:") or answer.startswith("REFUSED:"):
         return 1
+    return 0
+
+
+def _cmd_inbox(argv: list[str]) -> int:
+    """List pending mailbox entries for a label.
+
+    Usage: teammate-mcp inbox [<label>]
+
+    With no label, uses the caller's own pane label resolved via
+    TERM_SESSION_ID against the registry.
+    """
+    label = argv[0] if argv else ""
+    if not label:
+        from .server import _osa_session_info as _osi  # noqa: F401  (may not exist)
+        from . import registry
+        tsid = os.environ.get("TERM_SESSION_ID", "")
+        sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+        for lbl, rec in registry.all_labels().items():
+            rec_sid = (rec.get("session_id") or "").upper()
+            if sid_tail and (rec_sid == sid_tail or rec_sid.endswith(sid_tail)):
+                label = lbl
+                break
+    if not label:
+        print("ERROR: no label given and could not resolve caller", file=sys.stderr)
+        return 2
+    from .server import _list_inbox
+    items = _list_inbox(label)
+    if not items:
+        print(f"(empty inbox for {label})")
+        return 0
+    for entry in items:
+        ts = entry.get("created_at", "?")
+        frm = entry.get("from_", "?")
+        jid = entry.get("job_id", "?")
+        body = (entry.get("body") or "").replace("\n", " ")
+        if len(body) > 80:
+            body = body[:77] + "…"
+        print(f"{ts}  [{jid[:18]}…]  {frm:>10} → {label:<10}  {body}")
     return 0
 
 
@@ -624,6 +680,8 @@ def main():
         sys.exit(_cmd_exists(rest))
     if cmd == "ask":
         sys.exit(_cmd_ask(rest))
+    if cmd == "inbox":
+        sys.exit(_cmd_inbox(rest))
     if cmd == "unregister":
         sys.exit(_cmd_unregister(rest))
     if cmd == "statusline":

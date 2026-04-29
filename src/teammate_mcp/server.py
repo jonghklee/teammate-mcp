@@ -38,6 +38,7 @@ from .iterm import (
     find_session_by_job,
     get_screen,
     osa_capture,
+    osa_clear_and_inject,
     osa_extract_compose,
     osa_send_raw,
     osa_send_text,
@@ -454,28 +455,15 @@ async def _ask_async(
                 _log.event("ask.lock_timeout_proceeding", id=msg.id,
                            target=addressee)
             local_saved = osa_extract_compose(sid)
+            clear_count = len(local_saved) + 4 if local_saved else 0
             if local_saved:
                 _log.event("ask.compose_snapshot", id=msg.id,
                            saved_len=len(local_saved),
                            preview=local_saved[:40])
-                try:
-                    # Hard clear: send Backspace (DEL=0x7f) once per
-                    # *character* in the saved text, plus a small
-                    # safety pad. ESC ESC + Ctrl+U was unreliable —
-                    # in some Claude Code TUI states the compose box
-                    # ignored both, leaving the user text in place
-                    # and our body got appended → merged submit.
-                    # Per-char DEL is what `<-` does on the keyboard
-                    # and Claude Code always honours it.
-                    pad = 4
-                    clear_seq = "\x7f" * (len(local_saved) + pad)
-                    osa_send_raw(sid, clear_seq)
-                    time.sleep(0.05)
-                except Exception as e:
-                    _log.event("ask.compose_clear_failed",
-                               id=msg.id, error=repr(e))
             try:
-                osa_send_text(sid, body, True)
+                # Single osascript: DEL × clear_count + body + Enter.
+                # Saves ~400-600 ms vs. doing them as separate calls.
+                osa_clear_and_inject(sid, clear_count, body)
                 _log.event("ask.send", id=msg.id, to=addressee,
                            session_id=sid, mode="legacy-keystroke",
                            restoring=bool(local_saved))
@@ -484,12 +472,11 @@ async def _ask_async(
                            id=msg.id, error=repr(e))
                 return local_saved, False
             if local_saved:
-                # Restore INSIDE the lock so a queued second sender
-                # cannot snapshot a transient empty compose between
-                # our inject and our restore. Sleep cut to 1.0s
-                # (down from 2.0) — receiver only needs to commit
-                # the submit, not finish responding.
-                time.sleep(1.0)
+                # Fixed short sleep — receiver TUIs commit submits
+                # within ~150-300 ms after Enter, so 0.4s is a safe
+                # margin without burning extra osascript calls in a
+                # poll loop.
+                time.sleep(0.4)
                 try:
                     osa_send_text(sid, local_saved, False)
                     _log.event("ask.compose_restored", id=msg.id,

@@ -255,10 +255,11 @@ end tell
 
 # Match common compose prompt lines. Patterns seen on real panes:
 #   Claude Code:  "  ❯ user typed text here"   /   "  ❯ "
-#   Codex CLI:    "  > user typed text here"   /   "  ▌ user typed …"
-# We allow leading whitespace before the prompt char, and capture
-# everything after the prompt mark up to end-of-line.
-_COMPOSE_LINE_RE = re.compile(r"^\s*[❯▌>]\s?(.*)$")
+#   Codex CLI:    "  ▌ user typed text here"
+# We deliberately drop bare ">" — it appears inside ASK body lines
+# like "<your reply>" and inside markdown blockquotes, causing
+# false-positive captures of our own echoed payload.
+_COMPOSE_LINE_RE = re.compile(r"^\s*[❯▌]\s?(.*)$")
 
 
 def osa_extract_compose(session_id: str) -> str:
@@ -306,6 +307,18 @@ end tell
             continue
         rest = m.group(1)
         rest = strip_ansi(rest).rstrip(" \x00")
+        # Guard against capturing our own injected body — it shows
+        # up in the visible buffer for a split-second after a sibling
+        # ask. Treat any of these signatures as "not user input":
+        FALSE_POSITIVES = (
+            "[teammate-mcp ASK",
+            "teammate-mcp ASK ",
+            "Reply when you can by calling",
+            "no marker required",
+            "tmdone-",
+        )
+        if any(sig in rest for sig in FALSE_POSITIVES):
+            return ""
         return rest
     return ""
 

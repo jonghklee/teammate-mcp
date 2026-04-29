@@ -484,6 +484,12 @@ async def _ask_async(
                 except Exception as e:
                     _log.event("ask.restore_failed",
                                id=msg.id, error=repr(e))
+                # Tiny settling delay BEFORE we release the lock, so
+                # a queued sibling sender doesn't snapshot a
+                # transient state where the receiver is still
+                # repainting (and our restored text might be hidden
+                # behind ASK echo lines).
+                time.sleep(0.2)
             return local_saved, True
 
     try:

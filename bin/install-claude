@@ -1,0 +1,161 @@
+#!/usr/bin/env zsh
+# install-claude — wire teammate-mcp into Claude Code in one shot.
+#
+# Idempotent: re-running is safe.
+#
+# What it does:
+#   1. Symlinks each commands/*.md into ~/.claude/commands/ so the
+#      slash commands (/ask, /tmclaude, /tmcodex, /team-list, …) are
+#      available in every Claude Code session.
+#   2. Inserts the templates/CLAUDE.md routing rules into
+#      ~/.claude/CLAUDE.md between TEAMMATE_MCP_START / _END markers.
+#      Re-running replaces the block; never duplicates.
+#   3. Registers the MCP server with Claude Code (claude mcp add).
+#   4. Adds ./.venv/bin to your PATH via ~/.zshrc (only if not already
+#      there) so `teammate-mcp` resolves without an absolute path —
+#      this is what /ask uses.
+#
+# Usage:
+#   ./bin/install-claude            # install everything
+#   ./bin/install-claude --dry-run  # show what would change
+#   ./bin/install-claude --no-path  # skip the PATH change
+
+set -euo pipefail
+
+REPO_ROOT="${0:A:h:h}"
+COMMANDS_SRC="$REPO_ROOT/commands"
+TEMPLATE_CLAUDE_MD="$REPO_ROOT/templates/CLAUDE.md"
+VENV_BIN="$REPO_ROOT/.venv/bin"
+
+CLAUDE_DIR="$HOME/.claude"
+CLAUDE_COMMANDS="$CLAUDE_DIR/commands"
+CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+ZSHRC="$HOME/.zshrc"
+
+DRY_RUN=0
+SKIP_PATH=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --no-path) SKIP_PATH=1 ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *) echo "unknown arg: $arg" >&2; exit 2 ;;
+    esac
+done
+
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "DRY: $*"
+    else
+        eval "$@"
+    fi
+}
+
+mkdir -p "$CLAUDE_COMMANDS"
+
+# ---- 1. Install slash commands --------------------------------------------
+echo "→ installing slash commands to $CLAUDE_COMMANDS"
+installed=0
+for src in "$COMMANDS_SRC"/*.md; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "$src")"
+    dest="$CLAUDE_COMMANDS/$name"
+    if [[ -L "$dest" ]] && [[ "$(readlink "$dest")" == "$src" ]]; then
+        echo "  skip: $name (already linked)"
+        continue
+    fi
+    if [[ -e "$dest" ]] && [[ ! -L "$dest" ]]; then
+        backup="${dest}.bak.$(date +%s)"
+        run "mv '$dest' '$backup'"
+        echo "  backed up existing $name -> $(basename "$backup")"
+    fi
+    run "ln -sf '$src' '$dest'"
+    echo "  ok: $name"
+    installed=$((installed+1))
+done
+echo "  → $installed slash command(s) installed"
+
+# ---- 2. Merge CLAUDE.md routing block -------------------------------------
+START_MARK='<!-- TEAMMATE_MCP_START -->'
+END_MARK='<!-- TEAMMATE_MCP_END -->'
+
+# Extract just the block from the template (between the markers, inclusive).
+block="$(awk "/$START_MARK/{flag=1} flag; /$END_MARK/{flag=0}" "$TEMPLATE_CLAUDE_MD")"
+if [[ -z "$block" ]]; then
+    echo "ERROR: could not extract block from $TEMPLATE_CLAUDE_MD" >&2
+    exit 3
+fi
+
+if [[ -f "$CLAUDE_MD" ]] && grep -qF "$START_MARK" "$CLAUDE_MD"; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "→ DRY: would replace TEAMMATE_MCP block in $CLAUDE_MD"
+    else
+        backup="${CLAUDE_MD}.bak.$(date +%s)"
+        cp "$CLAUDE_MD" "$backup"
+        python3 - "$CLAUDE_MD" "$START_MARK" "$END_MARK" <<PY
+import sys, re
+path, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
+new_block = """$block"""
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
+text = pattern.sub(new_block.strip(), text)
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+        echo "→ replaced TEAMMATE_MCP block in $CLAUDE_MD (backup: $(basename "$backup"))"
+    fi
+else
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "→ DRY: would append TEAMMATE_MCP block to $CLAUDE_MD"
+    else
+        printf '\n%s\n' "$block" >> "$CLAUDE_MD"
+        echo "→ appended TEAMMATE_MCP block to $CLAUDE_MD"
+    fi
+fi
+
+# ---- 3. Register MCP server with Claude Code ------------------------------
+if command -v claude >/dev/null 2>&1; then
+    if claude mcp list 2>/dev/null | grep -q '^teammate'; then
+        echo "→ skip: 'teammate' already registered with claude"
+    else
+        run "claude mcp add teammate -s user -- '$VENV_BIN/teammate-mcp' serve"
+        echo "→ registered MCP server with claude"
+    fi
+else
+    echo "→ skip: 'claude' CLI not found; run manually:"
+    echo "    claude mcp add teammate -s user -- $VENV_BIN/teammate-mcp serve"
+fi
+
+# ---- 4. Add venv bin to PATH ----------------------------------------------
+if [[ $SKIP_PATH -eq 0 ]]; then
+    MARKER='# >>> teammate-mcp PATH'
+    if grep -qF "$MARKER" "$ZSHRC" 2>/dev/null; then
+        echo "→ skip: teammate-mcp PATH already in $ZSHRC"
+    else
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "→ DRY: would append teammate-mcp PATH to $ZSHRC"
+        else
+            cat >> "$ZSHRC" <<ZSH
+
+$MARKER
+# Adds the teammate-mcp venv binary directory to PATH so /ask and the
+# wrappers (tmclaude, tmcodex) resolve without an absolute path.
+export PATH="$VENV_BIN:\$PATH"
+# <<< teammate-mcp PATH
+ZSH
+            echo "→ added teammate-mcp PATH to $ZSHRC (open a new shell to apply)"
+        fi
+    fi
+fi
+
+echo
+echo "Done. To verify in a new shell:"
+echo
+echo "    teammate-mcp version             # CLI on PATH"
+echo "    teammate-mcp register-pane       # register THIS pane"
+echo "    /ask <label> <question>          # in a Claude Code session"
+echo

@@ -76,15 +76,42 @@ uv venv
 uv pip install -e .
 ```
 
-### 2. Register the server with both CLIs
+### 2a. One-shot Claude Code wiring (recommended)
 
 ```sh
-# Claude Code
-claude mcp add teammate -s user -- $PWD/.venv/bin/teammate-mcp serve
-
-# Codex
-codex  mcp add teammate           -- $PWD/.venv/bin/teammate-mcp serve
+./bin/install-claude
 ```
+
+Idempotent. This single script:
+
+1. Registers the MCP server with Claude Code (`claude mcp add teammate …`)
+2. Symlinks every `commands/*.md` into `~/.claude/commands/` so the
+   `/ask`, `/tmclaude`, `/tmcodex`, `/team-list`, `/team-register`
+   slash commands work in every Claude Code session
+3. Inserts the `templates/CLAUDE.md` natural-language routing block
+   into `~/.claude/CLAUDE.md` between `<!-- TEAMMATE_MCP_START -->`
+   markers (replaces on re-run, never duplicates; backs up first)
+4. Appends `<repo>/.venv/bin` to your `~/.zshrc` PATH so `teammate-mcp`,
+   `tmclaude`, `tmcodex` resolve without an absolute path
+
+After this, in a *new* shell:
+
+```
+teammate-mcp version          # CLI on PATH
+tmclaude                      # register THIS pane and start Claude Code
+/ask <label> <question>       # inside Claude Code, fast cross-pane ask
+```
+
+Flags: `--dry-run` (preview), `--no-path` (skip the PATH change).
+
+### 2b. Codex (manual)
+
+```sh
+codex mcp add teammate -- $PWD/.venv/bin/teammate-mcp serve
+```
+
+Codex has no slash commands; it picks up `templates/AGENTS.md` from
+your project root automatically.
 
 ### 3. Open the panes
 

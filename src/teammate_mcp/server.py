@@ -459,8 +459,18 @@ async def _ask_async(
                            saved_len=len(local_saved),
                            preview=local_saved[:40])
                 try:
-                    osa_send_raw(sid, "\x1b\x1b\x15")
-                    time.sleep(0.08)
+                    # Hard clear: send Backspace (DEL=0x7f) once per
+                    # *character* in the saved text, plus a small
+                    # safety pad. ESC ESC + Ctrl+U was unreliable —
+                    # in some Claude Code TUI states the compose box
+                    # ignored both, leaving the user text in place
+                    # and our body got appended → merged submit.
+                    # Per-char DEL is what `<-` does on the keyboard
+                    # and Claude Code always honours it.
+                    pad = 4
+                    clear_seq = "\x7f" * (len(local_saved) + pad)
+                    osa_send_raw(sid, clear_seq)
+                    time.sleep(0.05)
                 except Exception as e:
                     _log.event("ask.compose_clear_failed",
                                id=msg.id, error=repr(e))
@@ -476,8 +486,10 @@ async def _ask_async(
             if local_saved:
                 # Restore INSIDE the lock so a queued second sender
                 # cannot snapshot a transient empty compose between
-                # our inject and our restore.
-                time.sleep(2.0)
+                # our inject and our restore. Sleep cut to 1.0s
+                # (down from 2.0) — receiver only needs to commit
+                # the submit, not finish responding.
+                time.sleep(1.0)
                 try:
                     osa_send_text(sid, local_saved, False)
                     _log.event("ask.compose_restored", id=msg.id,

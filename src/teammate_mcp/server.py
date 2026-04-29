@@ -15,6 +15,9 @@ marker, polls for the marker, then returns the extracted answer.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import re
@@ -85,6 +88,57 @@ def _mailbox_dir(label: str, sub: str) -> Path:
     p = MAILBOX_ROOT / label / sub
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+@contextlib.contextmanager
+def _per_target_send_lock(target_label: str, max_wait: float = 60.0):
+    """Cross-process exclusive lock per target pane.
+
+    Two callers (in separate Python processes — e.g. two CLI invocations
+    from two different agents) can race on the same receiver: each
+    snapshots the compose box, then both clear+inject, and the second
+    one's restore overwrites the first one's. asyncio.Lock can't
+    serialise that because the processes don't share an event loop.
+
+    flock() does. Each target gets its own lock file at
+    ``~/.teammate-mcp/mailbox/<label>/.send-lock``. We block (with a
+    cap) until the lock is acquired, perform snapshot→clear→inject→
+    sleep→restore inside the lock, then release. Any second sender
+    waits in line and operates on whatever the compose box looks like
+    AFTER the first one has fully finished its restore — so the
+    second sender's snapshot includes whatever the user typed during
+    the first send PLUS the first sender's restore — i.e. the live
+    state, not stale.
+    """
+    target_dir = MAILBOX_ROOT / target_label
+    target_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = target_dir / ".send-lock"
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.monotonic() + max_wait
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError as e:
+                if e.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+                if time.monotonic() >= deadline:
+                    # Time-out — proceed without the lock rather than
+                    # silently drop the message. The caller's snapshot
+                    # may collide; surface this in the log.
+                    break
+                time.sleep(0.1)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        os.close(fd)
 
 
 def _write_inbox(target_label: str, record: dict) -> Path:
@@ -389,40 +443,54 @@ async def _ask_async(
     #      the inbox file remains and the hook acts as fallback.
     saved_compose = ""
     delivered_via_keystroke = False
+    # Acquire per-target cross-process lock. Two senders to the same
+    # pane run snapshot→clear→inject→restore strictly in series, so
+    # neither one's restore wipes the other one's body.
+    def _acquire_and_run():
+        """Sync helper because flock + osascript are blocking I/O.
+        Returns (saved, delivered)."""
+        with _per_target_send_lock(addressee) as got_lock:
+            if not got_lock:
+                _log.event("ask.lock_timeout_proceeding", id=msg.id,
+                           target=addressee)
+            local_saved = osa_extract_compose(sid)
+            if local_saved:
+                _log.event("ask.compose_snapshot", id=msg.id,
+                           saved_len=len(local_saved),
+                           preview=local_saved[:40])
+                try:
+                    osa_send_raw(sid, "\x1b\x1b\x15")
+                    time.sleep(0.08)
+                except Exception as e:
+                    _log.event("ask.compose_clear_failed",
+                               id=msg.id, error=repr(e))
+            try:
+                osa_send_text(sid, body, True)
+                _log.event("ask.send", id=msg.id, to=addressee,
+                           session_id=sid, mode="legacy-keystroke",
+                           restoring=bool(local_saved))
+            except Exception as e:
+                _log.event("ask.send_failed_falling_back_to_file",
+                           id=msg.id, error=repr(e))
+                return local_saved, False
+            if local_saved:
+                # Restore INSIDE the lock so a queued second sender
+                # cannot snapshot a transient empty compose between
+                # our inject and our restore.
+                time.sleep(2.0)
+                try:
+                    osa_send_text(sid, local_saved, False)
+                    _log.event("ask.compose_restored", id=msg.id,
+                               restored_len=len(local_saved))
+                except Exception as e:
+                    _log.event("ask.restore_failed",
+                               id=msg.id, error=repr(e))
+            return local_saved, True
+
     try:
-        saved_compose = await asyncio.to_thread(osa_extract_compose, sid)
-        if saved_compose:
-            _log.event("ask.compose_snapshot", id=msg.id,
-                       saved_len=len(saved_compose),
-                       preview=saved_compose[:40])
-            try:
-                await asyncio.to_thread(osa_send_raw, sid, "\x1b\x1b\x15")
-                await asyncio.sleep(0.08)
-            except Exception as e:
-                _log.event("ask.compose_clear_failed",
-                           id=msg.id, error=repr(e))
-        await asyncio.to_thread(osa_send_text, sid, body, True)
-        delivered_via_keystroke = True
-        _log.event("ask.send", id=msg.id, to=addressee, session_id=sid,
-                   mode="legacy-keystroke",
-                   restoring=bool(saved_compose))
-        if saved_compose:
-            # Restore INLINE (not asyncio.create_task) — when ``ask``
-            # is invoked via the CLI, ``asyncio.run`` exits the moment
-            # this coroutine returns and any pending background tasks
-            # get cancelled before they can run. We block the caller
-            # for ~2 s instead, which is the same window the receiver
-            # needs to commit our submit anyway.
-            await asyncio.sleep(2.0)
-            try:
-                await asyncio.to_thread(
-                    osa_send_text, sid, saved_compose, False,
-                )
-                _log.event("ask.compose_restored", id=msg.id,
-                           restored_len=len(saved_compose))
-            except Exception as e:
-                _log.event("ask.restore_failed",
-                           id=msg.id, error=repr(e))
+        saved_compose, delivered_via_keystroke = await asyncio.to_thread(
+            _acquire_and_run,
+        )
     except Exception as e:
         _log.event("ask.send_failed_falling_back_to_file",
                    id=msg.id, error=repr(e))

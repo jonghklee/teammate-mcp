@@ -33,13 +33,25 @@ are addressable. An unregistered pane is invisible to `ask`.
 
 If the user's *entire* message is one of these one-word commands
 (possibly with surrounding whitespace or punctuation), treat it as
-register-this-pane and call `mcp__teammate__register_self()` with no
-arguments — DO NOT ask what they mean, DO NOT do anything else this
-turn:
+register-this-pane and **run the Bash CLI directly** — DO NOT call
+`mcp__teammate__register_self`, DO NOT ask what they mean, DO NOT do
+anything else this turn:
 
 - `등록` / `등록해` / `등록해줘` / `등록 진행` / `등록좀` / `등록 좀`
 - `register` / `register me` / `tag me` / `tag this pane`
 - `whoami 등록` / `이거 등록` / `이 페인 등록`
+
+→ Mapping (rigid):
+
+```bash
+teammate-mcp register-pane
+```
+
+(or, if not on PATH: `<repo>/.venv/bin/teammate-mcp register-pane`)
+
+Print the command's stdout verbatim and end the turn. The CLI is
+pure, fast, and bypasses both the deferred-MCP-tool ToolSearch and
+LLM extended thinking.
 
 Other phrasings that imply registration (treat as register, but a
 short clarifying nod is OK if ambiguous):
@@ -49,12 +61,13 @@ short clarifying nod is OK if ambiguous):
 - "너 등록해줘" / "register this pane"
 - (with explicit name) "너 이름은 agent1이야" / "register me as plan"
 
-→ Call `mcp__teammate__register_self`:
-- with **no label argument** → server auto-assigns `claude1`/`codex1`/…
-- with the user-supplied label (e.g. "register me as plan") → use it
-  verbatim
+→ Same Bash CLI; if the user gave an explicit label, pass it via env:
 
-Then confirm in one short line ("✓ registered as claude1") and end
+```bash
+TEAMMATE_LABEL=<label> teammate-mcp register-pane
+```
+
+Then confirm in one short line ("✓ registered as <label>") and end
 the turn.
 
 ### Asking another teammate

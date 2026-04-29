@@ -356,6 +356,20 @@ async def _ask_async(
     #   to set that field. Caller blocks until the field appears or
     #   timeout elapses. Same compose-safety as async mode.
     if not wait:
+        # Optional best-effort keystroke wake for receivers that don't
+        # have the v0.7+ UserPromptSubmit hook installed (e.g. Codex
+        # panes, legacy Claude Code sessions started before
+        # ``install-claude`` ran). The user opts in via the env var
+        # ``TEAMMATE_INJECT=1`` because the wake re-introduces the
+        # compose-merge risk for whichever pane it lands on; absent
+        # the env var, async stays purely file-only.
+        if os.environ.get("TEAMMATE_INJECT", "").strip() in ("1", "true", "yes"):
+            try:
+                if osa_session_alive(sid):
+                    await asyncio.to_thread(osa_send_text, sid, body, True)
+                    _log.event("ask.legacy_inject", id=msg.id, to=addressee, session_id=sid)
+            except Exception as e:
+                _log.event("ask.legacy_inject_failed", id=msg.id, error=repr(e))
         _queue.complete(msg.id, "")
         _log.event("ask.queued", id=msg.id, mode="async", delivery="file-only")
         return f"queued: job_id={msg.id} to {addressee} (async, mailbox file)"

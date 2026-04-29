@@ -5,6 +5,38 @@ You are working alongside other AI agents in sibling iTerm panes. A
 **label**, by its **iTerm session name**, or by its **session id
 prefix** — whichever is most convenient.
 
+## Reserved-keyword trigger — "등록" / "register"
+
+If the user's *entire* message is one of these one-word commands
+(possibly with surrounding whitespace or punctuation), treat it as
+register-this-pane and **run the Bash CLI directly** — do NOT call
+`mcp__teammate__register_self`, do NOT ask what they mean, do NOT do
+anything else this turn:
+
+- `등록` / `등록해` / `등록해줘` / `등록 진행` / `등록좀` / `등록 좀`
+- `register` / `register me` / `tag me` / `tag this pane`
+- `whoami 등록` / `이거 등록` / `이 페인 등록`
+
+→ Mapping (rigid):
+
+```bash
+teammate-mcp register-pane
+```
+
+(or, if not on PATH: `<repo>/.venv/bin/teammate-mcp register-pane`)
+
+Print the command's stdout verbatim and end the turn. The CLI is
+pure, fast, and bypasses both the deferred-MCP-tool ToolSearch and
+extended thinking.
+
+If the user gave an explicit label ("register me as worker", "너 이름은
+worker야"), pass it via env:
+
+```bash
+TEAMMATE_LABEL=<label> teammate-mcp register-pane
+```
+
+
 ## How to address a teammate
 
 ```

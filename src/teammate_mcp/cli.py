@@ -51,6 +51,12 @@ Environment variables:
   TEAMMATE_CWD          override pane disambiguation cwd (default: $PWD)
   TEAMMATE_LOG_FILE     0|1  write JSONL log to ~/.teammate-mcp/logs/
   TEAMMATE_LOG_VERBOSE  0|1  echo log to stderr
+  TEAMMATE_INJECT       0|1  also inject the body via keystrokes (best-effort
+                              wake for receivers without the v0.7+ hook).
+                              WARNING: re-introduces compose-merge risk —
+                              only set this when you know the receiver
+                              cannot drain via hook (codex panes, legacy
+                              sessions). Default: off.
 
 Recommended workflow:
   alias tmclaude='teammate-mcp register-pane && claude'

@@ -29,16 +29,30 @@ If sibling iTerm panes are running other agents, you may call:
 **Important**: only panes that have been *explicitly registered*
 are addressable. An unregistered pane is invisible to `ask`.
 
-When the user addresses *you* with phrases like:
+**Reserved-keyword trigger — "등록"**
+
+If the user's *entire* message is one of these one-word commands
+(possibly with surrounding whitespace or punctuation), treat it as
+register-this-pane and call `mcp__teammate__register_self()` with no
+arguments — DO NOT ask what they mean, DO NOT do anything else this
+turn:
+
+- `등록` / `등록해` / `등록해줘` / `등록 진행` / `등록좀` / `등록 좀`
+- `register` / `register me` / `tag me` / `tag this pane`
+- `whoami 등록` / `이거 등록` / `이 페인 등록`
+
+Other phrasings that imply registration (treat as register, but a
+short clarifying nod is OK if ambiguous):
 
 - `/team-register` (slash form)
 - "이 페인 등록해줘" / "이 페인 태그해줘"
 - "너 등록해줘" / "register this pane"
 - (with explicit name) "너 이름은 agent1이야" / "register me as plan"
 
-→ **Immediately call `mcp__teammate__register_self`**:
-- with **no label argument** → server auto-assigns `claude1`/`codex1`/...
-- with the user-supplied label → use it verbatim
+→ Call `mcp__teammate__register_self`:
+- with **no label argument** → server auto-assigns `claude1`/`codex1`/…
+- with the user-supplied label (e.g. "register me as plan") → use it
+  verbatim
 
 Then confirm in one short line ("✓ registered as claude1") and end
 the turn.

@@ -472,11 +472,12 @@ async def _ask_async(
                            id=msg.id, error=repr(e))
                 return local_saved, False
             if local_saved:
-                # Fixed short sleep — receiver TUIs commit submits
-                # within ~150-300 ms after Enter, so 0.4s is a safe
-                # margin without burning extra osascript calls in a
-                # poll loop.
-                time.sleep(0.4)
+                # 0.15s — Claude Code commits Enter ~100-150ms.
+                # Concurrent-ASK diagnostic showed 0.15 is the sweet
+                # spot: 0.10 caused dropped Enters (3.1s gap), 0.25
+                # was longer hold than necessary (2.99s gap), 0.15
+                # gave 2.5s — best in our test matrix.
+                time.sleep(0.15)
                 try:
                     osa_send_text(sid, local_saved, False)
                     _log.event("ask.compose_restored", id=msg.id,
@@ -484,12 +485,9 @@ async def _ask_async(
                 except Exception as e:
                     _log.event("ask.restore_failed",
                                id=msg.id, error=repr(e))
-                # Tiny settling delay BEFORE we release the lock, so
-                # a queued sibling sender doesn't snapshot a
-                # transient state where the receiver is still
-                # repainting (and our restored text might be hidden
-                # behind ASK echo lines).
-                time.sleep(0.2)
+                # No settling sleep — guard catches stale-echo
+                # snapshots, and the next sender's snapshot can
+                # tolerate transient repaint.
             return local_saved, True
 
     try:

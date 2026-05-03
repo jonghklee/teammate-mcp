@@ -27,3 +27,4 @@ tests/results/2*.jsonl
 # OS
 .DS_Store
 .ccb/
+.claude/

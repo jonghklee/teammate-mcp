@@ -59,6 +59,33 @@ PROJECT_CWD = os.environ.get("TEAMMATE_CWD") or os.getcwd()
 # Mailbox root — daemonless persistent queue (CCB-style serial-per-agent
 # inbox/processed directories).
 MAILBOX_ROOT = Path.home() / ".teammate-mcp" / "mailbox"
+SPOOL_ROOT = Path.home() / ".teammate-mcp" / "spool"
+
+# Bodies above this size get spilled to a markdown file, and the
+# inject becomes a short reference: "본문은 <path> 에 있습니다".
+# Default 2 KB — small enough that compose-merge / clear cost is
+# trivial, big enough that normal questions still inline.
+SPILL_THRESHOLD = int(os.environ.get("TEAMMATE_SPILL_THRESHOLD", "2048"))
+
+
+def _spill_body(job_id: str, from_agent: str, addressee: str, body: str) -> Path:
+    """Write the full body to ~/.teammate-mcp/spool/<job_id>.md.
+
+    Returns the absolute path. Receiver's LLM is instructed to read
+    this file via the short reference inject.
+    """
+    SPOOL_ROOT.mkdir(parents=True, exist_ok=True)
+    p = SPOOL_ROOT / f"{job_id}.md"
+    header = (
+        f"<!-- teammate-mcp spool\n"
+        f"     job_id : {job_id}\n"
+        f"     from   : {from_agent}\n"
+        f"     to     : {addressee}\n"
+        f"     bytes  : {len(body.encode('utf-8'))}\n"
+        f"-->\n\n"
+    )
+    p.write_text(header + body, encoding="utf-8")
+    return p
 
 
 # Pre-flight danger patterns. If we see any of these in the last few
@@ -413,17 +440,34 @@ async def _ask_async(
         _log.event("ask.inbox_write_failed", id=msg.id, error=repr(e))
 
     marker = f"tmdone-{msg.id}-end"
+    # Spill huge bodies to disk and inject only a short reference.
+    # Threshold gates by *byte* count, not chars, since multibyte
+    # Korean inflates fast.
+    use_spool = len(question.encode("utf-8")) > SPILL_THRESHOLD
+    if use_spool:
+        spool_path = _spill_body(msg.id, from_agent, addressee, question)
+        body_kernel = (
+            f"본문이 길어서 파일로 저장됐어. 이 파일을 읽어 처리해줘:\n"
+            f"  {spool_path}\n\n"
+            f"(파일 내용 = 본인의 user prompt 라고 생각하면 됨. "
+            f"처리 후 파일 그대로 두거나 unlink 가능.)"
+        )
+        _log.event("ask.spilled", id=msg.id, path=str(spool_path),
+                   bytes=len(question.encode("utf-8")))
+    else:
+        body_kernel = question
+
     if wait:
         body = (
             f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
-            f"{question}\n\n"
+            f"{body_kernel}\n\n"
             f"When you finish, output exactly this marker on its own line:\n"
             f"{marker}\n"
         )
     else:
         body = (
             f"[teammate-mcp ASK {msg.id} from={from_agent} mode=async]\n"
-            f"{question}\n\n"
+            f"{body_kernel}\n\n"
             f"Reply when you can by calling: "
             f"`teammate-mcp ask {from_agent} \"<your reply>\" --no-wait`\n"
             f"(no marker required; the sender is not blocked).\n"

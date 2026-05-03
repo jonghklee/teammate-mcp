@@ -150,6 +150,20 @@ After the CLI/tool returns, print the answer back to the user verbatim
 If the user explicitly types `/ask <label> <question…>`, follow the
 slash command spec — do not second-guess.
 
+### Receiving an ASK with spilled body (large messages)
+
+When the injected ASK body looks like:
+
+    [teammate-mcp ASK <id> from=<sender> ...]
+    본문이 길어서 파일로 저장됐어. 이 파일을 읽어 처리해줘:
+      /Users/siheom-yong/.teammate-mcp/spool/<job_id>.md
+
+**Read that file as your actual user prompt** — it holds the real
+message. The text shown in the ASK is just a pointer (the sender
+spilled to disk because the body was over ~2 KB and would otherwise
+slow down keystroke injection / risk compose corruption). After
+processing you can leave the spool file in place or unlink it.
+
 ### Receiving an async ASK (mailbox / email mode)
 
 When you see an injected message that looks like::

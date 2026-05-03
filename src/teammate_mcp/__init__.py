@@ -1,3 +1,3 @@
 """teammate-mcp — inter-agent Q&A through iTerm panes."""
 
-__version__ = "0.10.9"
+__version__ = "0.10.10"

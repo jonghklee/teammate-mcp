@@ -30,11 +30,11 @@ Usage:
   teammate-mcp whoami           print THIS pane's label (or "(unregistered)")
   teammate-mcp exists LBL       exit 0 if LBL is registered, 1 if not
   teammate-mcp ask LBL Q...     ask LBL the question Q.
-                                Default: ASYNC / mailbox (file-only, no
-                                keystroke injection — caller never blocks,
-                                target's compose box never corrupted).
-                                Use --wait for legacy sync mode (keystroke
-                                injection + marker poll).
+                                Default ASYNC / mailbox; --wait for sync.
+                                For bodies > ~500KB use --stdin or --body-file
+                                to avoid OS argv limit (ARG_MAX).
+                                  echo "<huge>" | teammate-mcp ask --stdin LBL
+                                  teammate-mcp ask --body-file <path> LBL
   teammate-mcp inbox [LBL]      list pending mailbox entries for LBL
                                 (defaults to caller's own pane label)
   teammate-mcp mark-processed   close a sync ask: write processed/<id>.json
@@ -464,6 +464,8 @@ def _cmd_ask(argv: list[str]) -> int:
     """
     timeout = 300
     wait = False  # v0.8.0: default async (mailbox/file-only delivery)
+    body_from_stdin = False
+    body_from_file = None
     # Two-pass: extract flags from anywhere in argv, leaving positional
     # args (label + question words) intact. This is forgiving of LLM
     # output that puts --async/--timeout after the label.
@@ -491,20 +493,49 @@ def _cmd_ask(argv: list[str]) -> int:
             except ValueError:
                 print(f"ERROR: --timeout must be an integer", file=sys.stderr)
                 return 2
+        elif a in ("--stdin", "--body-from-stdin"):
+            # Read body from stdin — bypasses ARG_MAX (the OS limit
+            # on argv length, which on macOS hits ~1MB and breaks
+            # CLI invocations with large bodies). Receiver still
+            # gets the full text.
+            body_from_stdin = True
+        elif a in ("--body-file",) and src:
+            body_from_file = src.pop(0)
+        elif a.startswith("--body-file="):
+            body_from_file = a.split("=", 1)[1]
         elif a == "--":
             args.extend(src)
             break
         else:
             args.append(a)
-    if len(args) < 2:
-        print("usage: teammate-mcp ask [--timeout N] [--no-wait] <label> <question...>",
-              file=sys.stderr)
-        return 2
-    target = args[0]
-    question = " ".join(args[1:]).strip()
-    if not question:
-        print("ERROR: empty question", file=sys.stderr)
-        return 2
+    if (body_from_stdin or body_from_file):
+        if not args:
+            print("usage: teammate-mcp ask --stdin <label>  (then pipe body)",
+                  file=sys.stderr)
+            return 2
+        target = args[0]
+        if body_from_stdin:
+            question = sys.stdin.read().strip()
+        else:
+            try:
+                with open(body_from_file, encoding="utf-8") as f:
+                    question = f.read().strip()
+            except Exception as e:
+                print(f"ERROR: cannot read --body-file: {e}", file=sys.stderr)
+                return 2
+        if not question:
+            print("ERROR: empty body from stdin/file", file=sys.stderr)
+            return 2
+    else:
+        if len(args) < 2:
+            print("usage: teammate-mcp ask [--timeout N] [--no-wait] [--stdin] [--body-file PATH] <label> <question...>",
+                  file=sys.stderr)
+            return 2
+        target = args[0]
+        question = " ".join(args[1:]).strip()
+        if not question:
+            print("ERROR: empty question", file=sys.stderr)
+            return 2
 
     from .server import _ask_async
     answer = asyncio.run(_ask_async(question=question, timeout=timeout,

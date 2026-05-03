@@ -517,15 +517,21 @@ async def _ask_async(
                 return local_saved, False
             if local_saved:
                 # 0.15s — Claude Code commits Enter ~100-150ms.
-                # Concurrent-ASK diagnostic showed 0.15 is the sweet
-                # spot: 0.10 caused dropped Enters (3.1s gap), 0.25
-                # was longer hold than necessary (2.99s gap), 0.15
-                # gave 2.5s — best in our test matrix.
                 time.sleep(0.15)
                 try:
-                    osa_send_text(sid, local_saved, False)
+                    if "\n" in local_saved:
+                        # Multi-line: each \n must become Shift+Enter
+                        # (\x1b\r) — a bare \n would submit the body
+                        # mid-restore. send_raw bypasses the
+                        # bracket-paste wrap that splits a paste's
+                        # final \r off as a real Enter.
+                        seq = local_saved.replace("\n", "\x1b\r")
+                        osa_send_raw(sid, seq)
+                    else:
+                        osa_send_text(sid, local_saved, False)
                     _log.event("ask.compose_restored", id=msg.id,
-                               restored_len=len(local_saved))
+                               restored_len=len(local_saved),
+                               multiline="\n" in local_saved)
                 except Exception as e:
                     _log.event("ask.restore_failed",
                                id=msg.id, error=repr(e))

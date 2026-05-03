@@ -281,16 +281,20 @@ _COMPOSE_LINE_RE = re.compile(r"^\s*❯\s?(.*)$")
 
 def osa_extract_compose(session_id: str) -> str:
     """Best-effort extraction of the user's typed-but-unsubmitted text
-    from a Claude Code / Codex session's compose box.
+    from a Claude Code session's compose box.
 
-    Returns the text after the last visible "❯ " (or ">", "▌") prompt
-    on screen, stripped of trailing whitespace and null padding.
-    Empty string if no match (or compose appears empty).
+    Supports MULTI-LINE composes:
+      ❯ first line
+        second line       ← indented
+        third line
+      ─────────────────  ← bottom horizontal rule (boundary)
 
-    Light: only reads the last 15 visible lines via a focused
-    AppleScript so we don't pay the cost of pulling the entire
-    scrollback every call (relevant inside the per-target lock —
-    snapshot+restore both call this).
+    Returns lines joined by '\\n'. Empty string if compose appears
+    empty or we can't find the ❯ prompt.
+
+    Light: only reads the visible buffer via ``text of s`` (no
+    scrollback) so we don't pay the cost of pulling tens of
+    thousands of lines every call.
     """
     # Targeted AppleScript: ask iTerm for just the visible buffer
     # (no scrollback). On a typical pane that's <100 lines vs
@@ -318,26 +322,71 @@ end tell
         return ""
     if not screen:
         return ""
-    for line in reversed(screen.splitlines()[-25:]):
-        m = _COMPOSE_LINE_RE.match(line)
-        if not m:
+    lines = screen.splitlines()
+    # Find the LAST ❯ line index (within the bottom 25 lines)
+    window = lines[-25:]
+    base = max(0, len(lines) - 25)
+    prompt_idx = -1
+    for i in range(len(window) - 1, -1, -1):
+        if _COMPOSE_LINE_RE.match(window[i]):
+            prompt_idx = i
+            break
+    if prompt_idx < 0:
+        return ""
+
+    # Capture the prompt line (strip "❯ ") + subsequent indented
+    # continuation lines until we hit a boundary:
+    #   - bottom horizontal rule (─ × ≥5)
+    #   - status bar (`bypass permissions`, `[label]` pattern)
+    #   - blank line followed by another structural element
+    parts = []
+    m = _COMPOSE_LINE_RE.match(window[prompt_idx])
+    first = strip_ansi(m.group(1)).rstrip(" \x00")
+    parts.append(first)
+
+    # Walk forward; lines that begin with two spaces (Claude Code's
+    # multi-line indent) belong to the same compose. Strip the
+    # indent. Stop on rule / status / next ❯ / hard stop.
+    HRULE = re.compile(r"^\s*─{5,}")
+    NEXT_PROMPT = re.compile(r"^\s*[❯▌]")
+    STATUS_PATTERNS = ("bypass permissions", "shift+tab", "[claude", "[codex")
+    for j in range(prompt_idx + 1, len(window)):
+        line = window[j]
+        if not line.strip():
+            # blank line — could be padding within compose or the gap
+            # before the bottom rule. Peek ahead.
+            ahead = next((window[k] for k in range(j + 1, len(window))
+                          if window[k].strip()), "")
+            if HRULE.match(ahead) or NEXT_PROMPT.match(ahead) or any(
+                s in ahead.lower() for s in STATUS_PATTERNS):
+                break
             continue
-        rest = m.group(1)
-        rest = strip_ansi(rest).rstrip(" \x00")
-        # Guard against capturing our own injected body — it shows
-        # up in the visible buffer for a split-second after a sibling
-        # ask. Treat any of these signatures as "not user input":
-        FALSE_POSITIVES = (
-            "[teammate-mcp ASK",
-            "teammate-mcp ASK ",
-            "Reply when you can by calling",
-            "no marker required",
-            "tmdone-",
-        )
-        if any(sig in rest for sig in FALSE_POSITIVES):
-            return ""
-        return rest
-    return ""
+        if HRULE.match(line) or NEXT_PROMPT.match(line):
+            break
+        if any(s in line.lower() for s in STATUS_PATTERNS):
+            break
+        # Strip leading spaces (Claude Code's 2-space indent for
+        # continuation rows). Use lstrip with limit to keep meaningful
+        # indentation in the user's text intact.
+        stripped = strip_ansi(line)
+        if stripped.startswith("  "):
+            stripped = stripped[2:]
+        parts.append(stripped.rstrip(" \x00"))
+
+    rest = "\n".join(parts).rstrip("\n ")
+
+    # Guard against false-positives (our own injected ASK echo lines
+    # transient on screen after a sibling sender).
+    FALSE_POSITIVES = (
+        "[teammate-mcp ASK",
+        "teammate-mcp ASK ",
+        "Reply when you can by calling",
+        "no marker required",
+        "tmdone-",
+    )
+    if any(sig in rest for sig in FALSE_POSITIVES):
+        return ""
+    return rest
 
 
 def osa_capture(session_id: str) -> str:

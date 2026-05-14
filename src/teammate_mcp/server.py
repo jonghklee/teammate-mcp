@@ -88,24 +88,11 @@ def _spill_body(job_id: str, from_agent: str, addressee: str, body: str) -> Path
     return p
 
 
-# Pre-flight danger patterns. If we see any of these in the last few
-# screen lines of the target pane, we refuse to inject keystrokes
-# (until the prompt clears or a max-wait elapses). This prevents the
-# "session freeze" failure mode where our injected text gets eaten by
-# a permission prompt or an interactive bash command.
-DANGER_PATTERNS = [
-    # Claude Code permission menu
-    "❯ 1.", "❯ 2.", "❯ 3.",
-    "Do you want to allow",
-    "Allow this command",
-    # generic confirms
-    "(y/n)", "(Y/n)", "(y/N)", "[y/N]", "[Y/n]",
-    "Press Y to confirm", "Press Enter to continue",
-    # interactive auth
-    "Password:", "password:", "passphrase:",
-    # shell-running interactive REPLs we shouldn't disturb
-    ">>> ",  # python REPL prompt
-]
+# (DANGER_PATTERNS + _wait_until_safe 제거됨 — 2026-05-14, picker detection 과 함께)
+# 옛 패턴: receiver pane 의 *위험한* screen 상태 (permission menu, AskUserQuestion,
+# y/n 확인, Password, REPL 등) 감지하면 inject 중단. picker detection 과 동일
+# 휴리스틱 — *환경 차원에서* picker 안 뜨게 강제했으니 (Claude Code deny +
+# codex yolo) 이 방어막도 dead. 호출처도 없는 dead code 였음.
 
 
 def _now_iso() -> str:
@@ -203,6 +190,115 @@ def _list_inbox(label: str) -> list[dict]:
     return out
 
 
+# (picker detection 코드 제거됨 — 2026-05-14)
+#
+# 옛 패턴: screen text 휴리스틱 (_PICKER_PATTERNS / _MENU_LINE_PREFIXES /
+# _MENU_WHITELIST / _pane_looks_like_picker) 으로 picker 추측. agent 응답의
+# markdown 번호 리스트 (1./2./3.) 가 picker 로 오인되는 false positive +
+# 새 phrase 마다 whitelist 무한 patch 가 본질적 한계였음.
+#
+# 새 전제: caller 가 picker UI 없는 환경을 *환경 차원에서 강제*:
+#   - Claude Code: settings.json 에 permissions.deny=["AskUserQuestion"]
+#   - codex: --dangerously-bypass-approvals-and-sandbox (yolo flag)
+# → keystroke 항상 inject, false positive 영원히 0.
+#
+# picker UI 가 환경에 다시 도입되어야 한다면 그때 추가.
+
+
+
+def _sanitize_for_inject(text: str) -> str:
+    """Strip control bytes that would corrupt a receiver TUI's parser.
+
+    Removes:
+      - ESC (``\\x1b``) — could start an ANSI escape sequence
+      - BEL (``\\x07``) — terminates OSC sequences, can wedge state
+      - NUL (``\\x00``) — undefined behavior in most line disciplines
+      - other C0 controls except TAB / LF / CR / vertical-tab
+
+    Newlines and tabs are preserved because they are legitimate body
+    content. We replace each stripped byte with a single space so
+    visible character counts and approximate layout are unchanged.
+
+    This is Fix C in the freeze investigation: if a user-provided ASK
+    body contained an unbalanced escape (e.g. ``\\x1b[200~`` starting
+    paste-mode), the receiver Claude/Codex TUI could end up wedged in
+    a phantom paste state where every key disappears.
+    """
+    if not text:
+        return text
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\t", "\n", "\r", "\v"):
+            out.append(ch)
+        elif code < 0x20 or code == 0x7f:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _body_stuck_in_compose(pane_content: str, job_id: str) -> bool:
+    """Return True when an injected ASK body is still sitting in compose.
+
+    Only the visible tail is considered for busy markers. Full scrollback
+    often contains old Claude status text ("Brewed", "✻", etc.); treating
+    that as current processing caused the force-Enter recovery to skip a
+    genuinely stuck compose box.
+    """
+    stuck_marker = f"[teammate-mcp ASK {job_id}"
+    if stuck_marker not in pane_content:
+        return False
+
+    lines = pane_content.splitlines()
+    marker_idx = -1
+    for i in range(len(lines) - 1, -1, -1):
+        if stuck_marker in lines[i]:
+            marker_idx = i
+            break
+    if marker_idx < 0:
+        return False
+    tail = "\n".join(lines[marker_idx:][-12:])
+    busy_markers = (
+        "✻", "⏺", "✶", "Worked for", "Brewed for",
+        "Thinking", "Running", "thinking", "running",
+    )
+    if any(b in tail for b in busy_markers):
+        return False
+    return stuck_marker in tail
+
+
+def _register_via_daemon_or_direct(
+    *,
+    label: str,
+    session_id: str,
+    pid: int,
+    job: str,
+    cwd: Optional[str],
+    extra: Optional[dict] = None,
+) -> None:
+    """Register a label, preferring the daemon RPC when available.
+
+    Falls back to the legacy direct-file path if the daemon socket is
+    missing or unreachable — keeps the system working when the daemon
+    isn't running or has crashed.
+    """
+    from . import daemon_client
+
+    if daemon_client.is_enabled():
+        ok = daemon_client.register(
+            label=label, session_id=session_id, pid=pid, job=job,
+            cwd=cwd, extra=extra or {},
+        )
+        if ok is not None:
+            return
+
+    registry.register(
+        label=label, session_id=session_id, pid=pid, job=job, cwd=cwd,
+        extra=extra or {}, dedupe_session_id=True,
+    )
+
+
 def archive_label_mailbox(label: str) -> Optional[Path]:
     """Move ~/.teammate-mcp/mailbox/<label>/ aside.
 
@@ -236,30 +332,6 @@ def archive_label_mailbox(label: str) -> Optional[Path]:
         return archive
     except Exception:
         return None
-
-
-async def _wait_until_safe(sid: str, max_wait: float = 30.0) -> tuple[bool, Optional[str]]:
-    """Poll the target pane's last screen lines for danger patterns.
-
-    Returns (safe, last_danger_pattern). If safe=True, danger=None.
-    If max_wait elapses with the pane still in a danger state,
-    returns (False, <pattern>). Callers can then either refuse to
-    inject (raise an error to the user) or queue without injecting
-    (target reads from inbox file later).
-    """
-    deadline = time.monotonic() + max_wait
-    last_danger: Optional[str] = None
-    while time.monotonic() < deadline:
-        try:
-            screen = await asyncio.to_thread(osa_capture, sid)
-        except Exception:
-            screen = ""
-        tail = "\n".join((screen or "").splitlines()[-8:])
-        last_danger = next((p for p in DANGER_PATTERNS if p in tail), None)
-        if last_danger is None:
-            return True, None
-        await asyncio.sleep(1.0)
-    return False, last_danger
 
 
 def _jobname_for(agent: str) -> str:
@@ -351,25 +423,24 @@ def _resolve_target_session_id(target: str, fallback_agent: Optional[str]) -> Op
 
 async def _ask_async(
     question: str,
-    timeout: int,
     target: str = "",
     fallback_agent: Optional[str] = None,
-    wait: bool = False,
+    timeout: int = 300,
     safe_max_wait: float = 30.0,
+    wait: bool = False,
+    mailbox_only: bool = False,
 ) -> str:
-    """Drive one ask: enqueue → push (osascript) → [optionally wait] → return.
+    """Drive one ask: enqueue → push (osascript) → return immediately.
 
-    If ``wait`` is True (default for backwards compat), polls the target's
-    screen for the completion marker and returns the extracted answer.
-    If ``wait`` is False, returns immediately after injecting the message,
-    with shape ``"queued: job_id=<id> to <target>"``. The target is
-    instructed (via the prompt body) to reply via a reverse ``ask`` —
-    the email-style mailbox model.
+    Always async (mailbox-based). The message is persisted to
+    ``~/.teammate-mcp/mailbox/<target>/inbox/<job_id>.json`` and the
+    receiver replies via its own reverse async ask. Sync mode was
+    removed — see CLI help.
 
-    Either way, the message is persisted to
-    ``~/.teammate-mcp/mailbox/<target>/inbox/<job_id>.json`` so that an
-    audit trail and recovery path always exist.
+    The ``wait`` kwarg is accepted for backwards compatibility with
+    older callers but is ignored: every ask is async.
     """
+    _ = wait  # accepted-but-ignored, see docstring
     addressee = target or fallback_agent or "<unspecified>"
     # Resolve `from_agent` in priority order:
     #   1. explicit env var (TEAMMATE_LABEL) — wrappers may set this
@@ -430,7 +501,6 @@ async def _ask_async(
         "from_": from_agent,
         "to": addressee,
         "body": question,
-        "wait": bool(wait),
         "created_at": _now_iso(),
         "status": "queued",
     }
@@ -438,6 +508,10 @@ async def _ask_async(
         _write_inbox(addressee, inbox_record)
     except Exception as e:
         _log.event("ask.inbox_write_failed", id=msg.id, error=repr(e))
+
+    if mailbox_only:
+        _log.event("ask.mailbox_only", id=msg.id, to=addressee)
+        return f"queued mailbox-only message for {addressee}"
 
     marker = f"tmdone-{msg.id}-end"
     # Spill huge bodies to disk and inject only a short reference.
@@ -457,21 +531,18 @@ async def _ask_async(
     else:
         body_kernel = question
 
-    if wait:
-        body = (
-            f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
-            f"{body_kernel}\n\n"
-            f"When you finish, output exactly this marker on its own line:\n"
-            f"{marker}\n"
-        )
-    else:
-        body = (
-            f"[teammate-mcp ASK {msg.id} from={from_agent} mode=async]\n"
-            f"{body_kernel}\n\n"
-            f"Reply when you can by calling: "
-            f"`teammate-mcp ask {from_agent} \"<your reply>\" --no-wait`\n"
-            f"(no marker required; the sender is not blocked).\n"
-        )
+    # Fix C: sanitize the body so a stray ESC/BEL in the user's question
+    # can't wedge the receiver TUI in a corrupt parser state (e.g. phantom
+    # paste-mode where every keystroke disappears).
+    body_kernel = _sanitize_for_inject(body_kernel)
+
+    body = (
+        f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
+        f"{body_kernel}\n\n"
+        f"Reply when you can by calling: "
+        f"`teammate-mcp ask {from_agent} \"<your reply>\"`\n"
+        f"(no marker required; the sender is not blocked).\n"
+    )
 
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
@@ -498,12 +569,54 @@ async def _ask_async(
             if not got_lock:
                 _log.event("ask.lock_timeout_proceeding", id=msg.id,
                            target=addressee)
+
+            # (Fix D — picker detection — removed)
+            # 사용자 결정 (2026-05-14): picker UI 자체를 환경에서 강제 차단
+            # (Claude Code 의 settings.json deny + codex 의 yolo flag) 하고
+            # screen-text 휴리스틱은 완전 제거. picker 없는 환경 전제 →
+            # keystroke 무조건 inject, false positive 영원히 0.
+            # _PICKER_PATTERNS / _MENU_LINE_PREFIXES / _MENU_WHITELIST /
+            # _pane_looks_like_picker 모두 삭제됨.
+
+            # Fix B: mid-typing detection. Two snapshots 300 ms apart;
+            # if the compose buffer changed in between, the user is
+            # actively typing into the target pane. Inject would race
+            # with their keystrokes and could leave the TUI in a
+            # corrupt half-paste state — the "this one pane freezes
+            # forever" symptom. Mailbox is already written; let the
+            # hook drain it on the user's next prompt instead.
             local_saved = osa_extract_compose(sid)
+            time.sleep(0.30)
+            second_snap = osa_extract_compose(sid)
+            if local_saved != second_snap:
+                _log.event(
+                    "ask.user_typing_aborted_inject",
+                    id=msg.id,
+                    before_len=len(local_saved),
+                    after_len=len(second_snap),
+                )
+                return second_snap, False
+            local_saved = second_snap  # stable
+
             clear_count = len(local_saved) + 4 if local_saved else 0
             if local_saved:
                 _log.event("ask.compose_snapshot", id=msg.id,
                            saved_len=len(local_saved),
                            preview=local_saved[:40])
+
+            # Fix A: defensive paste-mode terminator. If the pane is
+            # somehow already stuck inside paste-mode (e.g. a previous
+            # inject lost its end-of-paste marker), this empty
+            # ``\x1b[201~`` flushes it out before we type the real body.
+            # Harmless when not in paste-mode — every modern TUI ignores
+            # an orphan paste-end. Safer than risking a doubly-wedged
+            # parser.
+            try:
+                osa_send_raw(sid, "\x1b[201~")
+                time.sleep(0.05)
+            except Exception:
+                pass  # best-effort; not having this fallback isn't fatal
+
             try:
                 # Single osascript: DEL × clear_count + body + Enter.
                 # Saves ~400-600 ms vs. doing them as separate calls.
@@ -515,6 +628,59 @@ async def _ask_async(
                 _log.event("ask.send_failed_falling_back_to_file",
                            id=msg.id, error=repr(e))
                 return local_saved, False
+
+            # IMMEDIATELY remove the inbox file we wrote pre-flight so
+            # the receiver's UserPromptSubmit hook can't race ahead of
+            # us and re-deliver the same message as additional-context
+            # (the user saw this as the keystroke-injected message
+            # arriving twice — once in the compose body, once attached
+            # by the drain hook). Without this, hook drain at T+0.2s
+            # beats our outer unlink at T+1s.
+            try:
+                (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
+                    missing_ok=True,
+                )
+                _log.event("ask.inbox_unlinked_inline", id=msg.id)
+            except Exception as e:
+                _log.event("ask.inbox_unlink_failed", id=msg.id, error=repr(e))
+
+            # Fix E: post-inject verify + force Enter. If the inject
+            # didn't submit (long body + chunked keystroke race, or TUI
+            # treated trailing newline as paste-end instead of submit),
+            # our message header is still visible in the pane and the
+            # receiver is NOT processing it. Detect via full-pane capture
+            # (compose-only extraction misses multi-line bodies that have
+            # overflowed onto the chrome below the ❯ line), then forcibly
+            # send Enter to push it through.
+            try:
+                time.sleep(0.5)
+                pane_after = osa_capture(sid)
+                if _body_stuck_in_compose(pane_after, msg.id):
+                    _log.event(
+                        "ask.body_stuck_in_compose_forcing_enter",
+                        id=msg.id,
+                    )
+                    recovered = False
+                    for attempt in range(3):
+                        osa_send_raw(sid, "\r")
+                        time.sleep(0.4)
+                        check = osa_capture(sid)
+                        if not _body_stuck_in_compose(check, msg.id):
+                            _log.event(
+                                "ask.force_enter_recovered",
+                                id=msg.id,
+                                attempt=attempt + 1,
+                            )
+                            recovered = True
+                            break
+                    if not recovered:
+                        _log.event(
+                            "ask.recovery_failed_still_stuck",
+                            id=msg.id,
+                            warning="body remains after 3 Enter retries",
+                        )
+            except Exception as e:
+                _log.event("ask.verify_skipped", id=msg.id, error=repr(e))
             if local_saved:
                 # 0.15s — Claude Code commits Enter ~100-150ms.
                 time.sleep(0.15)
@@ -556,26 +722,16 @@ async def _ask_async(
         except Exception:
             pass
 
-    if not wait:
-        _queue.complete(msg.id, "")
-        return (f"sent: job_id={msg.id} to {addressee} "
-                f"({'keystroke' if delivered_via_keystroke else 'file-fallback'})")
-
-    # Sync: poll the receiver's screen for the marker (v0.6 path).
-    screen = await osa_wait_for_marker(
-        sid, marker, timeout=float(timeout),
-        poll_interval=0.5, min_count=2,
-    )
-    if screen is None:
-        _queue.fail(msg.id, "timeout")
-        _log.event("ask.timeout", id=msg.id, timeout=timeout,
-                   mode="legacy-marker")
-        return f"TIMEOUT: no '{marker}' within {timeout}s"
-    answer = extract_answer(screen, question, marker)
-    _queue.complete(msg.id, answer)
-    _log.event("ask.complete", id=msg.id, answer_len=len(answer),
-               mode="legacy-marker")
-    return answer or "(empty answer)"
+    # Always async path: kick watchdog so the receiver's hook fires soon,
+    # then return immediately. Receiver replies via reverse async ask.
+    try:
+        from .watcher import ensure_watchdog_running
+        ensure_watchdog_running()
+    except Exception:
+        pass
+    _queue.complete(msg.id, "")
+    return (f"sent: job_id={msg.id} to {addressee} "
+            f"({'keystroke' if delivered_via_keystroke else 'file-fallback'})")
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +740,7 @@ async def _ask_async(
 
 @mcp.tool()
 async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = False) -> str:
-    """Ask another pane a question.
+    """Ask another pane a question (always async).
 
     ``target`` may be:
       * a registered label (set via ``TEAMMATE_LABEL`` env or
@@ -593,32 +749,26 @@ async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = 
         case-insensitive exact match),
       * a session UUID prefix (≥ 6 chars).
 
-    ``wait``:
-      * ``False`` (default, async / mailbox / "email" mode): persist the
-        message to ``~/.teammate-mcp/mailbox/<target>/inbox/`` only —
-        NO keystroke injection. The receiver's ``UserPromptSubmit``
-        hook drains the inbox on its next user prompt and the LLM
-        replies via reverse async ``ask``. Caller is never blocked,
-        and the receiver's compose box / interactive bash / permission
-        prompts are NEVER corrupted.
-      * ``True`` (legacy sync): inject keystrokes into the target's
-        TUI and poll the target's screen for a completion marker.
-        Returns the answer or TIMEOUT after ``timeout`` seconds. Will
-        merge with text the user is mid-typing in the target compose
-        box, so prefer ``wait=False`` unless the caller genuinely
-        cannot proceed without the inline answer.
+    The message is persisted to ``~/.teammate-mcp/mailbox/<target>/inbox/``
+    and the receiver's ``UserPromptSubmit`` hook drains it on its next
+    user prompt. The receiver replies via a reverse async ``ask``.
+    Caller is never blocked, receiver's compose box is never corrupted.
+
+    The ``wait`` parameter is accepted for backwards compatibility but
+    has no effect — sync mode was removed because the receiver always
+    took the same mailbox path anyway; sync only blocked the sender
+    for no real-time benefit.
 
     When ``target`` is empty the caller's job name is used: a Claude
     caller falls back to "codex" and vice versa, preserving the v0.1
     1:1 default behaviour.
     """
+    _ = wait  # deprecated, ignored
     fallback = "codex" if (os.environ.get("TEAMMATE_LABEL") or "").lower().startswith("claude") else None
     if not target and fallback is None:
-        # We don't actually know which CLI is calling — let MCP decide
-        # from the legacy aliases below.
         fallback = None
-    return await _ask_async(question, timeout, target=target,
-                            fallback_agent=fallback, wait=wait)
+    return await _ask_async(question, target=target,
+                            fallback_agent=fallback, timeout=timeout)
 
 
 @mcp.tool()
@@ -636,14 +786,13 @@ async def inbox(label: str = "") -> list[dict]:
           "from_":     "claude4",
           "to":        "claude20",
           "body":      "<question text>",
-          "wait":      true | false,
           "created_at": "2026-04-29T05:30:12Z",
           "status":    "queued"
         }
 
     Use this from a receiver pane to drain pending mail when you are
     idle — process each entry and reply via ``ask(target=<from_>,
-    question=<reply>, wait=False)``.
+    question=<reply>)``.
     """
     label = label.strip()
     if not label:
@@ -660,6 +809,163 @@ async def inbox(label: str = "") -> list[dict]:
         if not label:
             return [{"error": "no caller label resolvable"}]
     return _list_inbox(label)
+
+
+@mcp.tool()
+async def spawn(label: str, command: str, cwd: str = "",
+                message: str = "", mode: str = "window",
+                wait_s: int = 20, yolo: bool = False,
+                screen: str = "", bounds: str = "") -> str:
+    """Spawn a new iTerm pane with a label, then optionally send an
+    initial message to it.
+
+    Args:
+        label:    Unique label for the new pane (e.g. "worker1").
+        command:  Shell command to run (e.g. "claude" or "codex").
+        cwd:      Working directory. Tilde-expanded. Defaults to caller's cwd.
+        message:  Optional first ask to send after registration.
+        mode:     "window" (default) | "tab" | "split-v" | "split-h".
+        wait_s:   Max seconds to wait for registration. Default 20.
+        yolo:     If True and command starts with ``codex``, automatically
+                  append ``--yolo`` (matches ``tmcodex`` alias). Default False.
+        screen:   Named region for a new window — "left" | "right" | "top"
+                  | "bottom" | "full". Only valid when mode="window".
+                  Overrides ``bounds``.
+        bounds:   Pixel rect as ``"x1,y1,x2,y2"`` for the new window. Only
+                  valid when mode="window". Ignored if ``screen`` is set.
+
+    Returns a status line describing the spawned pane.
+    """
+    import asyncio as _asyncio
+    args = ["teammate-mcp", "spawn", label, command]
+    if cwd:
+        args += ["--cwd", cwd]
+    if mode and mode != "window":
+        args += ["--mode", mode]
+    if wait_s and wait_s != 20:
+        args += ["--wait-s", str(int(wait_s))]
+    if yolo:
+        args += ["--yolo"]
+    if screen:
+        args += ["--screen", screen]
+    elif bounds:
+        args += ["--bounds", bounds]
+    if message:
+        args += ["-m", message]
+
+    proc = await _asyncio.create_subprocess_exec(
+        *args,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await _asyncio.wait_for(proc.communicate(), timeout=120.0)
+    except _asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return f"ERROR: spawn timed out after 120s"
+
+    stdout = out.decode("utf-8", errors="replace").strip()
+    stderr = err.decode("utf-8", errors="replace").strip()
+    if proc.returncode == 0:
+        return stdout or "ok"
+    head = stderr.splitlines()[0] if stderr else stdout
+    return f"ERROR (rc={proc.returncode}): {head}"
+
+
+@mcp.tool()
+async def spawned() -> str:
+    """List panes spawned by ``mcp__teammate__spawn`` / ``teammate-mcp spawn``.
+
+    Returns JSON output. Each entry includes the label, session_id, cwd,
+    original command, mode, spawn time, and a ``status`` field:
+      - ``alive`` — pane still open and registered under the same label
+      - ``label-reused`` — label exists but on a different session_id
+      - ``gone`` — pane closed; entry remains in the ledger until
+        purged via ``despawn --gone``
+    """
+    import asyncio as _asyncio
+    proc = await _asyncio.create_subprocess_exec(
+        "teammate-mcp", "spawned", "--json",
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    return out.decode("utf-8", errors="replace").strip() or "[]"
+
+
+@mcp.tool()
+async def despawn(label: str = "", all_: bool = False, gone: bool = False) -> str:
+    """Close (and unregister) panes spawned by this tool.
+
+    Args:
+        label:   single label to despawn. Ignored when ``all_`` or
+                 ``gone`` is set.
+        all_:    if True, despawn every pane recorded in the spawn ledger.
+        gone:    if True, purge ledger entries whose pane is already gone
+                 (no pane is closed; just cleans up the ledger).
+
+    Returns the despawn command's stdout (summary lines describing what
+    was closed). Refuses to close panes the user opened by hand — they
+    won't be in the ledger.
+    """
+    import asyncio as _asyncio
+    args = ["teammate-mcp", "despawn"]
+    if all_:
+        args.append("--all")
+    elif gone:
+        args.append("--gone")
+    elif label:
+        args.append(label)
+    else:
+        return "ERROR: provide label, all_=True, or gone=True"
+
+    proc = await _asyncio.create_subprocess_exec(
+        *args,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    stdout = out.decode("utf-8", errors="replace").strip()
+    stderr = err.decode("utf-8", errors="replace").strip()
+    if proc.returncode == 0:
+        return stdout or stderr or "ok"
+    return f"ERROR (rc={proc.returncode}): {(stderr or stdout).splitlines()[0] if (stderr or stdout) else 'unknown'}"
+
+
+@mcp.tool()
+async def close_pane(target: str, keep_label: bool = False) -> str:
+    """Close an iTerm pane by label or session_id.
+
+    Unlike ``despawn``, this does NOT require the pane to be in the
+    spawn ledger — works on any pane you can identify, including ones
+    you opened yourself or spawned via a custom skill script.
+
+    Args:
+        target:     A registered label, an 8+ char session_id prefix,
+                    or a full session_id UUID.
+        keep_label: If True, only close the pane; leave its registry
+                    entry alone. Default False (drop the label too).
+
+    Returns a short status line. Use this from skill cleanup scripts
+    (e.g. ``.claude/skills/<skill>/cleanup_pane.sh``) when you want a
+    spawned worker to remove itself after a task completes.
+    """
+    import asyncio as _asyncio
+    args = ["teammate-mcp", "close-pane", target]
+    if keep_label:
+        args.append("--keep-label")
+    proc = await _asyncio.create_subprocess_exec(
+        *args,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    stdout = out.decode("utf-8", errors="replace").strip()
+    stderr = err.decode("utf-8", errors="replace").strip()
+    if proc.returncode == 0:
+        return stdout or "ok"
+    return f"ERROR (rc={proc.returncode}): {(stderr or stdout).splitlines()[0] if (stderr or stdout) else 'unknown'}"
 
 
 @mcp.tool()
@@ -759,7 +1065,7 @@ async def register_self(label: str = "") -> str:
         )
         chosen = label.strip() or existing_label or _next_auto_label(match.job, match.name or "")
 
-        registry.register(
+        _register_via_daemon_or_direct(
             label=chosen,
             session_id=match.session_id,
             pid=os.getpid(),
@@ -861,7 +1167,7 @@ async def auto_register_session(connection, session_id: str,
             break
 
     label = explicit_label or existing_label or _next_auto_label(me.job, me.name)
-    registry.register(
+    _register_via_daemon_or_direct(
         label=label,
         session_id=me.session_id,
         pid=os.getpid(),
@@ -885,11 +1191,16 @@ def _classify(job: str, session_name: str = "") -> str:
     on platform, but its session_name typically contains 'Claude Code'.
     Codex is more honest and reports 'codex'. We check both fields.
     """
-    haystack = f"{job or ''} {session_name or ''}".lower()
-    if "claude" in haystack:
-        return "claude"
-    if "codex" in haystack:
+    job_haystack = (job or "").lower()
+    if "codex" in job_haystack:
         return "codex"
+    if "claude" in job_haystack:
+        return "claude"
+    name_haystack = (session_name or "").lower()
+    if "codex" in name_haystack:
+        return "codex"
+    if "claude" in name_haystack:
+        return "claude"
     return "agent"
 
 
@@ -941,7 +1252,7 @@ def _auto_register_from_env() -> None:
                 None,
             )
             label = explicit or existing_label or _next_auto_label(me.job, me.name or "")
-            registry.register(
+            _register_via_daemon_or_direct(
                 label=label,
                 session_id=me.session_id,
                 pid=os.getpid(),

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.teammate-mcp.daemon</string>
+
+  <!-- Run the daemon foreground (no --bg). launchd owns lifecycle. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp</string>
+    <string>daemon</string>
+  </array>
+
+  <!-- Restart immediately if the daemon dies for any reason. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start on login (LaunchAgent) so it's up before any pane. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Throttle so a fast crash loop doesn't melt the CPU.
+       launchd will refuse to relaunch faster than this. -->
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Make sure the daemon process itself can find Python. -->
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
+
+  <!-- Capture daemon stdout/stderr — also written to daemon.log via
+       --bg double-fork in CLI use, but launchd's foreground mode goes
+       through these. -->
+  <key>StandardOutPath</key>
+  <string>/Users/siheom-yong/.teammate-mcp/logs/daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/siheom-yong/.teammate-mcp/logs/daemon.err.log</string>
+
+  <!-- Daemon's working directory. Not strictly required since it uses
+       absolute paths internally, but a stable cwd makes core dumps and
+       hangs easier to diagnose. -->
+  <key>WorkingDirectory</key>
+  <string>/Users/siheom-yong</string>
+
+  <!-- Soft resource limits. Daemon is lightweight — these are
+       just safeguards against runaway state. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>1024</integer>
+  </dict>
+</dict>
+</plist>

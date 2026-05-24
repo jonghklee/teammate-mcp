@@ -421,6 +421,14 @@ def _resolve_target_session_id(target: str, fallback_agent: Optional[str]) -> Op
     return None
 
 
+def _ensure_watchdog_running_best_effort() -> None:
+    try:
+        from .watcher import ensure_watchdog_running
+        ensure_watchdog_running()
+    except Exception:
+        pass
+
+
 async def _ask_async(
     question: str,
     target: str = "",
@@ -428,7 +436,7 @@ async def _ask_async(
     timeout: int = 300,
     safe_max_wait: float = 30.0,
     wait: bool = False,
-    mailbox_only: bool = False,
+    mailbox_only: bool = True,
 ) -> str:
     """Drive one ask: enqueue → push (osascript) → return immediately.
 
@@ -511,6 +519,8 @@ async def _ask_async(
 
     if mailbox_only:
         _log.event("ask.mailbox_only", id=msg.id, to=addressee)
+        _ensure_watchdog_running_best_effort()
+        _queue.complete(msg.id, "")
         return f"queued mailbox-only message for {addressee}"
 
     marker = f"tmdone-{msg.id}-end"
@@ -540,7 +550,8 @@ async def _ask_async(
         f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
         f"{body_kernel}\n\n"
         f"Reply when you can by calling: "
-        f"`teammate-mcp ask {from_agent} \"<your reply>\"`\n"
+        f"`mcp__teammate__ask(target='{from_agent}', question='<your reply>')`\n"
+        f"Do not use Bash or write XML/tool tags for teammate replies.\n"
         f"(no marker required; the sender is not blocked).\n"
     )
 
@@ -724,11 +735,7 @@ async def _ask_async(
 
     # Always async path: kick watchdog so the receiver's hook fires soon,
     # then return immediately. Receiver replies via reverse async ask.
-    try:
-        from .watcher import ensure_watchdog_running
-        ensure_watchdog_running()
-    except Exception:
-        pass
+    _ensure_watchdog_running_best_effort()
     _queue.complete(msg.id, "")
     return (f"sent: job_id={msg.id} to {addressee} "
             f"({'keystroke' if delivered_via_keystroke else 'file-fallback'})")
@@ -813,7 +820,7 @@ async def inbox(label: str = "") -> list[dict]:
 
 @mcp.tool()
 async def spawn(label: str, command: str, cwd: str = "",
-                message: str = "", mode: str = "window",
+                message: str = "", mode: str = "split-v",
                 wait_s: int = 20, yolo: bool = False,
                 screen: str = "", bounds: str = "") -> str:
     """Spawn a new iTerm pane with a label, then optionally send an
@@ -824,7 +831,12 @@ async def spawn(label: str, command: str, cwd: str = "",
         command:  Shell command to run (e.g. "claude" or "codex").
         cwd:      Working directory. Tilde-expanded. Defaults to caller's cwd.
         message:  Optional first ask to send after registration.
-        mode:     "window" (default) | "tab" | "split-v" | "split-h".
+        mode:     "split-v" (default) | "split-h" | "tab" | "window".
+                  The default splits the CALLER's own pane (the pane this
+                  agent runs in — resolved via TEAMMATE_LABEL/registry,
+                  not iTerm's focused pane). Falls back to "window" if the
+                  caller pane can't be resolved. Use "window" for a
+                  free-standing window (e.g. with screen/bounds).
         wait_s:   Max seconds to wait for registration. Default 20.
         yolo:     If True and command starts with ``codex``, automatically
                   append ``--yolo`` (matches ``tmcodex`` alias). Default False.
@@ -840,7 +852,10 @@ async def spawn(label: str, command: str, cwd: str = "",
     args = ["teammate-mcp", "spawn", label, command]
     if cwd:
         args += ["--cwd", cwd]
-    if mode and mode != "window":
+    # Always forward --mode: the CLI's own default is now "split-v", so
+    # omitting it no longer means "window". Forward explicitly so the
+    # caller's chosen mode (including "window") is honored.
+    if mode:
         args += ["--mode", mode]
     if wait_s and wait_s != 20:
         args += ["--wait-s", str(int(wait_s))]

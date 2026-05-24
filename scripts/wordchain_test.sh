@@ -3,6 +3,7 @@
 #
 # 검증하는 스킬 (단 하나):
 #   • Bash CLI:  `teammate-mcp ask <label> "<question>"`     (default async, mailbox)
+#   • Test replies: `teammate-mcp ask --mailbox-only <caller> "<reply>"`
 #   • 답장 수신:  `~/.teammate-mcp/mailbox/<self>/inbox/*.json` 폴링
 #   • Wake:      별도로 `teammate-mcp watch &`가 띄워져 있다고 가정
 #                (idle Claude 페인을 "."로 깨워서 hook 발화시킴)
@@ -44,6 +45,10 @@ elif [[ "$#" -ge 3 ]]; then
 else
     LABELS=(a b c)
 fi
+if [[ "${#LABELS[@]}" -lt 2 ]]; then
+    echo "ERROR: LABELS must include at least two participants" >&2
+    exit 2
+fi
 
 # 자기 라벨 resolve (답장은 SELF의 inbox로 옴)
 SELF="${TEAMMATE_LABEL:-}"
@@ -61,7 +66,7 @@ echo "   시작 단어: $START_WORD"
 echo "   라운드  : $ROUNDS"
 echo "   참가자  : ${LABELS[*]}"
 echo "   caller  : $SELF"
-echo "   skill   : teammate-mcp ask (Bash CLI, async mailbox)"
+echo "   skill   : teammate-mcp ask (Bash CLI, async mailbox; replies mailbox-only)"
 echo "═══════════════════════════════════════════════════════════════"
 
 # 페인 alive 확인
@@ -92,12 +97,13 @@ mkdir -p "$(dirname "$LOCK")"
 touch "$LOCK"
 trap 'rm -f "$LOCK"' EXIT INT TERM
 
-# 라운드 진행: word 가 LABELS[i] → LABELS[(i+1)%3] 으로 흐름
+# 라운드 진행: word 가 LABELS[i] → LABELS[(i+1)%N] 으로 흐름
 word="$START_WORD"
 fails=0
 for r in $(seq 1 "$ROUNDS"); do
-    sender_idx=$(( (r-1) % 3 ))
-    receiver_idx=$(( r % 3 ))
+    participant_count="${#LABELS[@]}"
+    sender_idx=$(( (r-1) % participant_count ))
+    receiver_idx=$(( r % participant_count ))
     sender="${LABELS[$sender_idx]}"
     receiver="${LABELS[$receiver_idx]}"
     end_char="${word: -1}"
@@ -107,7 +113,7 @@ for r in $(seq 1 "$ROUNDS"); do
     echo "  $sender → $receiver  word='$word'  (다음 글자: '$end_char')"
 
     # 보낼 prompt: receiver는 답장만 (단어 하나) async로 SELF에게.
-    msg="끝말잇기 라운드 $r. 직전 단어: '$word'. 너는 '$end_char'로 시작하는 한국어 단어 하나만 답해. 단어만, 다른 말 X. 답은 'teammate-mcp ask $SELF \"<단어>\"' 로 보내."
+    msg="끝말잇기 라운드 $r. 직전 단어: '$word'. 너는 '$end_char'로 시작하는 한국어 단어 하나만 답해. 단어만, 다른 말 X. 답은 'teammate-mcp ask --mailbox-only $SELF \"<단어>\"' 로 보내."
 
     "$BIN" ask "$receiver" "$msg" >/dev/null
 

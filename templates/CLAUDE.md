@@ -120,32 +120,16 @@ English:
 **When in doubt, prefer asking the user one short clarifying question
 over silent guessing.** But for clear cases above, dispatch immediately.
 
-**Preferred path — Bash CLI (fast, deterministic, no MCP round-trip):**
+**Preferred path — MCP tool:** call `mcp__teammate__ask(target, question)`.
 
-```bash
-teammate-mcp ask <LABEL> "<QUESTION>"          # async (default since v0.8.0)
-teammate-mcp ask --wait <LABEL> "<QUESTION>"   # only when you must block for the reply
-```
+Use the MCP tool for teammate dispatch even when the target label is
+explicit (e.g. "claude20에게 …", "codex1에게 …"). Do not use Bash for
+teammate dispatch and do not write XML/tool tags such as `<invoke>` in
+plain text. The Bash path is intentionally avoided because Claude Code
+sessions can leak malformed tool-call text instead of executing it.
 
-The default is async — the message goes through the receiver's mailbox
-file and is drained by their UserPromptSubmit hook, so the target's
-compose-box never gets clobbered with our injected text. Reply
-arrives later as a reverse async ask in the caller's own inbox; the
-caller sees it on their next prompt.
-
-This bypasses the deferred MCP tool schema load and avoids extended
-thinking on tool routing. Use this whenever the target label is
-explicit in the user message (e.g. "claude20에게 …", "codex1에게 …").
-
-**Fallback — MCP tool:** call `mcp__teammate__ask(target, question)`
-only when:
-- the user did not give an explicit label (you must call `list_panes`
-  first to disambiguate), or
-- the question depends on context you'd otherwise have to thread
-  through the CLI string.
-
-After the CLI/tool returns, print the answer back to the user verbatim
-(do not re-summarize) and end the turn.
+After the MCP tool returns, print the returned string back to the user
+verbatim (do not re-summarize) and end the turn.
 
 If the user explicitly types `/ask <label> <question…>`, follow the
 slash command spec — do not second-guess.
@@ -172,15 +156,14 @@ When you see an injected message that looks like::
     <body>
 
     Reply when you can by calling:
-    `teammate-mcp ask <sender> "<your reply>" --no-wait`
+    `mcp__teammate__ask(target='<sender>', question='<your reply>')`
 
 You handle it the same way you'd handle a normal user prompt, then
 **send the reply back via a reverse async ask** so the original sender
 isn't blocked. Concretely:
 
 1. Compose your answer.
-2. Call `mcp__teammate__ask(target=<sender>, question=<answer>, wait=False)`,
-   or run `teammate-mcp ask <sender> "<answer>" --no-wait` via Bash.
+2. Call `mcp__teammate__ask(target=<sender>, question=<answer>)`.
 3. Optionally call `mcp__teammate__mark_processed(job_id=<job_id>, reply=<answer>)`
    to move the message from the inbox/ to processed/ on your mailbox.
 

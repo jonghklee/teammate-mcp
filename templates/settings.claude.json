@@ -11,6 +11,17 @@
     }
   },
 
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "teammate-mcp-hook-block-infinite-poll" }
+        ]
+      }
+    ]
+  },
+
   "permissions": {
     "allow": [
       "mcp__teammate__ask_codex",

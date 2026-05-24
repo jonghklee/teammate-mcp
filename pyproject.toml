@@ -32,6 +32,7 @@ dev = [
 
 [project.scripts]
 teammate-mcp = "teammate_mcp.cli:main"
+teammate-mcp-hook-block-infinite-poll = "teammate_mcp.hooks.block_infinite_poll:main"
 
 [project.urls]
 Homepage = "https://github.com/jonghklee/teammate-mcp"

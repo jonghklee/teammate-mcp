@@ -1,5 +1,5 @@
 ---
-description: "Ask another registered pane via the teammate-mcp CLI (bypasses MCP tool to skip deferred-schema load + extended-thinking overhead). Default ASYNC. Usage: /ask <label> <question...>"
+description: "Ask another registered pane via the teammate MCP tool. Default ASYNC/mailbox. Usage: /ask <label> <question...>"
 ---
 
 Parse the slash arguments. The first non-flag token is the target
@@ -11,34 +11,22 @@ The caller is never blocked, and the target's compose box / interactive
 bash / permission prompts are never corrupted by injected keystrokes.
 
 Supported flags (anywhere in the args):
-- `--wait`: legacy SYNC mode — inject keystrokes + poll the target's
-  screen for a completion marker. Use only when the caller cannot
-  proceed without the inline reply. Will MERGE with text the user is
-  mid-typing in the target compose box, so prefer the default.
 - `--async` / `--no-wait`: explicit async (default; included for clarity).
-- `--timeout N`: sync timeout in seconds (default 300; ignored when async).
+- `--timeout N`: accepted for compatibility and passed to the MCP tool.
+- `--wait`: deprecated; ignore it. Do not use sync/Bash dispatch.
 
-**Run this exact Bash command** — do NOT call `mcp__teammate__ask`,
-which is the whole point of this slash command. The MCP tool path
-incurs:
-- a deferred-schema `ToolSearch` round-trip on the first call per
-  session (1–3 s),
-- LLM extended-thinking time deciding to route to the tool (10–40 s
-  on Opus with thinking enabled).
+Call `mcp__teammate__ask` with:
+- `target` = the parsed label
+- `question` = the rest of the arguments, verbatim
+- `timeout` = parsed `--timeout` value if present, otherwise 300
 
-The CLI bypasses both:
+Do not write or simulate XML/tool tags such as `<invoke>`. Do not use
+Bash for teammate dispatch. The Bash path is intentionally avoided
+because Claude Code sessions can leak malformed tool-call text into the
+conversation instead of executing the command.
 
-```bash
-teammate-mcp ask <LABEL> "<QUESTION>"          # async (default)
-teammate-mcp ask --wait <LABEL> "<QUESTION>"   # legacy sync
-```
-
-Substitute `<LABEL>` and `<QUESTION>`; escape any literal `"` inside
-the question as `\"`. If `teammate-mcp` is not on PATH, fall back to
-the absolute venv path (`<repo>/.venv/bin/teammate-mcp`).
-
-Print the command's stdout back to the user verbatim, then end the
-turn. Do not summarise, do not add commentary, do not call any other
+Print the MCP tool's returned string back to the user verbatim, then end
+the turn. Do not summarise, do not add commentary, do not call any other
 tool.
 
 If the user did not supply both a label and a question, print:

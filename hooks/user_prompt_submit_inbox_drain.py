@@ -29,6 +29,16 @@ from pathlib import Path
 REGISTRY = Path.home() / ".teammate-mcp" / "registry.json"
 MAILBOX = Path.home() / ".teammate-mcp" / "mailbox"
 LOG = Path.home() / ".teammate-mcp" / "logs" / "hook-drain.log"
+DEFAULT_MAX_ATTACH = 5
+DEFAULT_MAX_BODY_BYTES = 16 * 1024
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int((os.environ.get(name) or "").strip())
+        return value if value > 0 else default
+    except Exception:
+        return default
 
 
 def _resolve_label() -> str:
@@ -84,18 +94,6 @@ def main() -> int:
     if LOCK.exists():
         return 0
 
-    # Opportunistic prune of dead registry entries — keeps `list` clean
-    # and recycles claudeN/codexN numbers without manual intervention.
-    # Wrap in broad except so a prune failure never blocks prompt submit.
-    try:
-        repo_src = Path(__file__).resolve().parent.parent / "src"
-        if str(repo_src) not in sys.path:
-            sys.path.insert(0, str(repo_src))
-        from teammate_mcp import registry as _reg  # noqa: E402
-        _reg.prune_dead()  # cached internally; cheap on repeat calls
-    except Exception:
-        pass
-
     label = _resolve_label()
     if not label:
         return 0
@@ -108,9 +106,13 @@ def main() -> int:
     files = sorted(inbox.glob("*.json"))
     if not files:
         return 0
+    max_attach = _env_int("TEAMMATE_HOOK_MAX_ATTACH", DEFAULT_MAX_ATTACH)
+    max_body_bytes = _env_int("TEAMMATE_HOOK_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES)
+    selected = files[:max_attach]
+    deferred = files[max_attach:]
 
     blocks = []
-    for p in files:
+    for p in selected:
         try:
             d = json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:
@@ -119,32 +121,25 @@ def main() -> int:
         sender = d.get("from_", "unknown")
         body = d.get("body", "")
         jid = d.get("job_id", "")
-        wait = bool(d.get("wait", False))
-        if wait:
-            # Sender is BLOCKED waiting for processed/<job_id>.json to
-            # gain a `terminal.reply` field. mark_processed is mandatory.
-            instr = (
-                f"⚠ This sender is BLOCKED on a sync ask. "
-                f"After composing your answer, you MUST call:\n"
-                f"  mcp__teammate__mark_processed(job_id='{jid}', "
-                f"target='{label}', reply='<your answer>')\n"
-                f"  — or — \n"
-                f"  teammate-mcp ask {sender} \"<your answer>\" --wait  "
-                f"(via Bash)\n"
-                f"Without that, the sender will time out."
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > max_body_bytes:
+            processed_hint = processed / p.name
+            preview = body_bytes[:max_body_bytes].decode("utf-8", errors="ignore")
+            body = (
+                f"{preview}\n\n"
+                f"[truncated by teammate-mcp hook: original body is {len(body_bytes)} bytes. "
+                f"After this hook finishes, read the full JSON at {processed_hint}]"
             )
-        else:
-            instr = (
-                f"To reply (async): `mcp__teammate__ask(target='{sender}', "
-                f"question='<reply>', wait=False)` "
-                f"or `teammate-mcp ask {sender} \"<reply>\"` via Bash. "
-                f"After replying, optionally call "
-                f"mcp__teammate__mark_processed(job_id='{jid}', target='{label}', reply='<reply>') "
-                f"to archive."
-            )
+        instr = (
+            f"To reply: `mcp__teammate__ask(target='{sender}', "
+            f"question='<reply>')`. "
+            f"Do not use Bash or write XML/tool tags for teammate replies. "
+            f"After replying, optionally call "
+            f"mcp__teammate__mark_processed(job_id='{jid}', target='{label}', reply='<reply>') "
+            f"to archive."
+        )
         blocks.append(
-            f"[teammate-mcp inbox: ASK from={sender} job_id={jid} "
-            f"mode={'sync (caller blocked)' if wait else 'async'}]\n"
+            f"[teammate-mcp inbox: ASK from={sender} job_id={jid}]\n"
             f"{body}\n"
             f"({instr})"
         )
@@ -166,12 +161,19 @@ def main() -> int:
         "════ teammate-mcp inbox (drained) ════\n"
         f"You ({label}) have {len(blocks)} pending message(s) from other panes. "
         f"Address them along with the user's request — for each, send a reply "
-        f"via reverse async ask so the original sender's mailbox is updated.\n\n"
+        f"via reverse async ask so the original sender's mailbox is updated."
+        + (
+            f"\n{len(deferred)} additional message(s) remain queued in "
+            f"{inbox}. They were not attached to keep this prompt bounded; "
+            f"submit another prompt or run `teammate-mcp drain {label}` to process the next batch."
+            if deferred else ""
+        )
+        + "\n\n"
         + "\n────\n".join(blocks)
         + "\n════ end inbox ════\n"
     )
     print(out)
-    _log(f"drained {len(blocks)} for label={label}")
+    _log(f"drained {len(blocks)} for label={label} deferred={len(deferred)}")
     return 0
 
 

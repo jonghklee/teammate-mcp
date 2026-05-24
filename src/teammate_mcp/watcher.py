@@ -30,6 +30,9 @@ Codex panes don't have a hook system, so we never wake them.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
+import fcntl
 import json
 import os
 import re
@@ -40,6 +43,11 @@ from pathlib import Path
 
 MAILBOX = Path.home() / ".teammate-mcp" / "mailbox"
 LOG = Path.home() / ".teammate-mcp" / "logs" / "watchdog.log"
+STATE_DIR = Path.home() / ".teammate-mcp" / "run"
+PID_PATH = STATE_DIR / "watchdog.pid"
+HEARTBEAT_PATH = STATE_DIR / "watchdog-heartbeat.json"
+ENSURE_LOCK_PATH = STATE_DIR / "watchdog-ensure.lock"
+RUN_LOCK_PATH = STATE_DIR / "watchdog.lock"
 # Wake text: a one-word prompt that's safe to inject into an empty
 # compose box. We pick "." because:
 #   - it triggers UserPromptSubmit (so the hook drains the inbox)
@@ -51,6 +59,7 @@ LOG = Path.home() / ".teammate-mcp" / "logs" / "watchdog.log"
 #     no hook fires — which defeats the wake. A bare word avoids that.
 WAKE_TEXT = "."
 DEFAULT_INTERVAL = 2.0
+HEALTH_STALE_AFTER = 15.0
 
 # Heuristic: a Claude Code compose box looks like
 #   ❯ <user text>
@@ -74,31 +83,187 @@ def _log(msg: str) -> None:
         sys.stderr.write(line)
 
 
-def _capture(session_id: str) -> str:
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_pid() -> int:
+    try:
+        return int(PID_PATH.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def _heartbeat_age() -> float | None:
+    try:
+        data = json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        return time.time() - float(data.get("ts", 0.0))
+    except Exception:
+        return None
+
+
+def _read_heartbeat() -> dict:
+    try:
+        return json.loads(HEARTBEAT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_heartbeat(interval: float) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    tmp = HEARTBEAT_PATH.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "ts": time.time(),
+            "interval": interval,
+            "wake_text": WAKE_TEXT,
+        }, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(HEARTBEAT_PATH)
+
+
+def watchdog_health(max_age: float = HEALTH_STALE_AFTER) -> tuple[bool, str]:
+    pid = _read_pid()
+    heartbeat = _read_heartbeat()
+    age = _heartbeat_age()
+    if not pid:
+        return False, "watchdog not running (no pidfile)"
+    if not _pid_alive(pid):
+        return False, f"watchdog not running (stale pid {pid})"
+    if age is None:
+        return False, f"watchdog pid {pid} has no heartbeat"
+    if age > max_age:
+        return False, f"watchdog pid {pid} heartbeat stale ({age:.1f}s)"
+    if heartbeat.get("wake_text") != WAKE_TEXT:
+        return (
+            False,
+            f"watchdog pid {pid} wake text changed "
+            f"({heartbeat.get('wake_text')!r} -> {WAKE_TEXT!r})",
+        )
+    return True, f"watchdog ok pid={pid} heartbeat_age={age:.1f}s"
+
+
+def ensure_watchdog_running(interval: float = DEFAULT_INTERVAL) -> tuple[bool, str]:
+    """Start a detached watchdog if the pid/heartbeat health check fails."""
+    ok, msg = watchdog_health(max_age=max(HEALTH_STALE_AFTER, interval * 4))
+    if ok:
+        return False, msg
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(ENSURE_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EACCES):
+                return False, "watchdog ensure already in progress"
+            raise
+
+        ok, healthy_msg = watchdog_health(max_age=max(HEALTH_STALE_AFTER, interval * 4))
+        if ok:
+            return False, healthy_msg
+        if "wake text changed" in healthy_msg:
+            old_pid = _read_pid()
+            if _pid_alive(old_pid):
+                with contextlib.suppress(Exception):
+                    os.kill(old_pid, 15)
+                    time.sleep(0.2)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "teammate_mcp.cli",
+            "watch",
+            "--interval",
+            str(interval),
+        ]
+        log = LOG.parent / "watchdog.ensure.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("ab") as out:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=out,
+                start_new_session=True,
+                close_fds=True,
+            )
+        _log(f"ensure-started pid={proc.pid} reason={msg}")
+        return True, f"started watchdog pid={proc.pid} ({msg})"
+    finally:
+        with contextlib.suppress(Exception):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _acquire_run_lock() -> int | None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(RUN_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+
+
+def _capture_all() -> dict[str, str]:
     script = (
         'tell application "iTerm"\n'
+        '    set out to ""\n'
         '    repeat with w in windows\n'
         '        repeat with t in tabs of w\n'
         '            repeat with s in sessions of t\n'
-        f'                if (unique id of s) is "{session_id}" then\n'
-        '                    return contents of s\n'
-        '                end if\n'
+        '                set out to out & "<<<TM_SESSION:" & (unique id of s) & ">>>" & (ASCII character 10)\n'
+        '                set out to out & (contents of s) & (ASCII character 10) & "<<<TM_END>>>" & (ASCII character 10)\n'
         '            end repeat\n'
         '        end repeat\n'
         '    end repeat\n'
+        '    return out\n'
         'end tell'
     )
     try:
-        r = subprocess.run(["osascript", "-e", script],
-                           check=True, capture_output=True, text=True, timeout=5)
-        return r.stdout
-    except Exception:
-        return ""
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            check=True, capture_output=True, text=True, timeout=8,
+        )
+    except Exception as e:
+        _log(f"capture-all-failed err={e!r}")
+        return {}
+
+    screens: dict[str, str] = {}
+    current_sid = ""
+    buf: list[str] = []
+    for line in r.stdout.splitlines():
+        if line.startswith("<<<TM_SESSION:") and line.endswith(">>>"):
+            if current_sid:
+                screens[current_sid] = "\n".join(buf)
+            current_sid = line[len("<<<TM_SESSION:"):-3].upper()
+            buf = []
+        elif line == "<<<TM_END>>>":
+            if current_sid:
+                screens[current_sid] = "\n".join(buf)
+            current_sid = ""
+            buf = []
+        elif current_sid:
+            buf.append(line)
+    if current_sid:
+        screens[current_sid] = "\n".join(buf)
+    return screens
 
 
-def _compose_is_empty(session_id: str) -> bool:
-    """True if the last few visible lines look like an empty compose box."""
-    screen = _capture(session_id)
+def _screen_compose_is_empty(screen: str) -> bool:
     if not screen:
         return False  # can't tell — be safe, skip wake
     lines = screen.splitlines()
@@ -142,23 +307,9 @@ def _wake(session_id: str) -> bool:
 
 
 def _alive_session_ids() -> set[str]:
-    script = (
-        'tell application "iTerm"\n'
-        '    set out to ""\n'
-        '    repeat with w in windows\n'
-        '        repeat with t in tabs of w\n'
-        '            repeat with s in sessions of t\n'
-        '                set out to out & (unique id of s) & "\n"\n'
-        '            end repeat\n'
-        '        end repeat\n'
-        '    end repeat\n'
-        '    return out\n'
-        'end tell'
-    )
     try:
-        r = subprocess.run(["osascript", "-e", script],
-                           check=True, capture_output=True, text=True, timeout=5)
-        return {ln.strip().upper() for ln in r.stdout.splitlines() if ln.strip()}
+        from teammate_mcp import registry
+        return set(registry.alive_session_ids_cached(force_refresh=False))
     except Exception:
         return set()
 
@@ -170,7 +321,25 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds between mailbox scans (default 2.0)")
     parser.add_argument("--once", action="store_true",
                         help="run a single scan then exit (for tests / smoke)")
+    parser.add_argument("--ensure", action="store_true",
+                        help="start a detached watchdog if health check is stale")
+    parser.add_argument("--health", action="store_true",
+                        help="print watchdog pid/heartbeat health and exit")
     args = parser.parse_args(argv)
+
+    if args.health:
+        ok, msg = watchdog_health()
+        print(msg)
+        return 0 if ok else 1
+    if args.ensure:
+        started, msg = ensure_watchdog_running(interval=args.interval)
+        print(("✓ " if started else "") + msg)
+        return 0
+
+    run_lock_fd = None if args.once else _acquire_run_lock()
+    if not args.once and run_lock_fd is None:
+        _log("watchdog already running; exiting duplicate")
+        return 0
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from teammate_mcp import registry  # noqa: E402
@@ -194,10 +363,12 @@ def main(argv: list[str] | None = None) -> int:
     _log(f"watchdog start interval={args.interval}s self_sid={self_sid[:8] or '(unknown)'}")
 
     def _scan_once() -> int:
-        registry.prune_dead(force_refresh=True)
+        _write_heartbeat(args.interval)
+        registry.prune_dead(force_refresh=False)
         labels = registry.all_labels()
         alive = _alive_session_ids()
         woken = 0
+        candidates: list[tuple[str, str, list[Path], float]] = []
         for label, rec in labels.items():
             sid = (rec.get("session_id") or "").upper()
             if sid not in alive:
@@ -232,7 +403,11 @@ def main(argv: list[str] | None = None) -> int:
                 # Cooldown — give the receiver time to finish its LLM
                 # turn before we poke it again.
                 continue
-            if _compose_is_empty(sid):
+            candidates.append((label, sid, files, now))
+
+        screens = _capture_all() if candidates else {}
+        for label, sid, files, now in candidates:
+            if _screen_compose_is_empty(screens.get(sid, "")):
                 if _wake(sid):
                     _log(f"woke label={label} for {len(files)} pending msg")
                     woken += 1

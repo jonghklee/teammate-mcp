@@ -279,6 +279,18 @@ end tell
 _COMPOSE_LINE_RE = re.compile(r"^\s*❯\s?(.*)$")
 
 
+def _strip_compose_padding(s: str) -> str:
+    """Strip trailing TUI cell-padding without touching internal text.
+
+    Claude Code pads compose-box lines to the pane width with regular
+    spaces AND U+00A0 (NBSP); iTerm can also leave NUL guards. A plain
+    ``rstrip(" \\x00")`` leaves the NBSP behind, which silently corrupts
+    the extracted compose text with invisible trailing chars. Strip
+    spaces, NBSP, NUL and tabs.
+    """
+    return s.rstrip(" \xa0\x00\t")
+
+
 def osa_extract_compose(session_id: str) -> str:
     """Best-effort extraction of the user's typed-but-unsubmitted text
     from a Claude Code session's compose box.
@@ -323,9 +335,10 @@ end tell
     if not screen:
         return ""
     lines = screen.splitlines()
-    # Find the LAST ❯ line index (within the bottom 25 lines)
-    window = lines[-25:]
-    base = max(0, len(lines) - 25)
+    # Find the LAST ❯ line index (within the bottom 40 lines — a
+    # multi-line compose plus its status-bar tail can exceed 25 rows).
+    window = lines[-40:]
+    base = max(0, len(lines) - 40)
     prompt_idx = -1
     for i in range(len(window) - 1, -1, -1):
         if _COMPOSE_LINE_RE.match(window[i]):
@@ -341,7 +354,7 @@ end tell
     #   - blank line followed by another structural element
     parts = []
     m = _COMPOSE_LINE_RE.match(window[prompt_idx])
-    first = strip_ansi(m.group(1)).rstrip(" \x00")
+    first = _strip_compose_padding(strip_ansi(m.group(1)))
     parts.append(first)
 
     # Walk forward; lines that begin with two spaces (Claude Code's
@@ -371,7 +384,7 @@ end tell
         stripped = strip_ansi(line)
         if stripped.startswith("  "):
             stripped = stripped[2:]
-        parts.append(stripped.rstrip(" \x00"))
+        parts.append(_strip_compose_padding(stripped))
 
     rest = "\n".join(parts).rstrip("\n ")
 
@@ -623,7 +636,7 @@ def _command_matches(command_line: str, target: str) -> bool:
     """
     if not command_line or not target:
         return False
-    pattern = rf"(?:^|[/\s\"'\-])({re.escape(target)})(?:$|[\s\"'\-])"
+    pattern = rf"(?:^|[/\s\"'])({re.escape(target)})(?:$|[\s\"'])"
     return re.search(pattern, command_line, re.IGNORECASE) is not None
 
 

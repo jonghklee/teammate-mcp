@@ -119,6 +119,7 @@ fi
 
 # ---- 2.5  Install UserPromptSubmit hook (inbox drain) ---------------------
 HOOK_SRC="$REPO_ROOT/hooks/user_prompt_submit_inbox_drain.py"
+POLL_HOOK_CMD="$VENV_BIN/teammate-mcp-hook-block-infinite-poll"
 CLAUDE_SETTINGS="$CLAUDE_DIR/settings.json"
 
 if [[ ! -x "$HOOK_SRC" ]]; then
@@ -130,6 +131,14 @@ elif [[ ! -f "$CLAUDE_SETTINGS" ]]; then
         cat > "$CLAUDE_SETTINGS" <<JSON
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$POLL_HOOK_CMD" }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -140,7 +149,7 @@ elif [[ ! -f "$CLAUDE_SETTINGS" ]]; then
   }
 }
 JSON
-        echo "→ created $CLAUDE_SETTINGS with UserPromptSubmit hook"
+        echo "→ created $CLAUDE_SETTINGS with Bash guard + UserPromptSubmit hook"
     fi
 else
     # Settings file exists — add hook only if not already present.
@@ -164,6 +173,33 @@ pathlib.Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "
 PY
             echo "→ added UserPromptSubmit hook to $CLAUDE_SETTINGS (backup: $(basename "$backup"))"
         fi
+    fi
+fi
+
+# ---- 2.6  Install PreToolUse hook (blocks runaway Bash polling loops) -----
+if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    :
+elif grep -qF "teammate-mcp-hook-block-infinite-poll" "$CLAUDE_SETTINGS"; then
+    echo "→ skip: Bash polling guard already in $CLAUDE_SETTINGS"
+else
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "→ DRY: would add Bash polling guard to $CLAUDE_SETTINGS"
+    else
+        backup="${CLAUDE_SETTINGS}.bak.$(date +%s)"
+        cp "$CLAUDE_SETTINGS" "$backup"
+        python3 - "$CLAUDE_SETTINGS" "$POLL_HOOK_CMD" <<'PY'
+import json, sys, pathlib
+path, hook = sys.argv[1], sys.argv[2]
+data = json.loads(pathlib.Path(path).read_text())
+data.setdefault("hooks", {})
+pre = data["hooks"].setdefault("PreToolUse", [])
+pre.append({
+    "matcher": "Bash",
+    "hooks": [{"type": "command", "command": hook}],
+})
+pathlib.Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+        echo "→ added Bash polling guard to $CLAUDE_SETTINGS (backup: $(basename "$backup"))"
     fi
 fi
 

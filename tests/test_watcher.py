@@ -133,3 +133,35 @@ def test_screen_compose_is_empty_rejects_typed_prompt():
     ])
 
     assert not watcher._screen_compose_is_empty(screen)
+
+
+# --- starvation escape: distinguish "user typing" from "Claude working" ---
+
+_EMPTY_PROMPT = "\n".join(["out", "  ❯ ", "────────────", "bypass permissions"])
+_USER_TYPING = "\n".join(["out", "  ❯ half typed message", "────────────"])
+# Claude mid-turn: no ❯ prompt visible (a spinner / tool output instead)
+_CLAUDE_WORKING = "\n".join(["✻ Working… (esc to interrupt)", "  ⎿ running tool"])
+
+
+def test_screen_user_is_typing_only_true_for_nonempty_prompt():
+    assert watcher._screen_user_is_typing(_USER_TYPING)
+    assert not watcher._screen_user_is_typing(_EMPTY_PROMPT)
+    # No ❯ prompt at all = Claude working, NOT user typing.
+    assert not watcher._screen_user_is_typing(_CLAUDE_WORKING)
+
+
+def test_wake_action_empty_prompt_wakes_immediately():
+    assert watcher._wake_action(_EMPTY_PROMPT, 0.0, 90.0) == "wake"
+
+
+def test_wake_action_never_injects_while_user_typing():
+    # Even past the starvation timeout, a half-typed compose is sacred.
+    assert watcher._wake_action(_USER_TYPING, 999.0, 90.0) == "skip-typing"
+
+
+def test_wake_action_working_pane_waits_then_force_wakes():
+    # Claude busy, under timeout → hold.
+    assert watcher._wake_action(_CLAUDE_WORKING, 30.0, 90.0) == "wait"
+    # Waited past timeout → force-wake (the starvation escape).
+    assert watcher._wake_action(_CLAUDE_WORKING, 90.0, 90.0) == "wake-starved"
+    assert watcher._wake_action(_CLAUDE_WORKING, 120.0, 90.0) == "wake-starved"

@@ -19,6 +19,14 @@
           { "type": "command", "command": "teammate-mcp-hook-block-infinite-poll" }
         ]
       }
+    ],
+    "_comment_Stop": "Deterministic ping-pong: on turn end, if this pane has pending teammate mail, block the stop and process it (loop-safe via stop_hook_active). bin/install-claude wires this automatically; adjust the path if installed elsewhere. Append alongside any existing Stop hooks (e.g. a notify hook).",
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 ~/programming/teammate-mcp/hooks/stop_inbox_drain.py" }
+        ]
+      }
     ]
   },
 

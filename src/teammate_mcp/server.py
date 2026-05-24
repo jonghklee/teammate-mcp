@@ -640,21 +640,6 @@ async def _ask_async(
                            id=msg.id, error=repr(e))
                 return local_saved, False
 
-            # IMMEDIATELY remove the inbox file we wrote pre-flight so
-            # the receiver's UserPromptSubmit hook can't race ahead of
-            # us and re-deliver the same message as additional-context
-            # (the user saw this as the keystroke-injected message
-            # arriving twice — once in the compose body, once attached
-            # by the drain hook). Without this, hook drain at T+0.2s
-            # beats our outer unlink at T+1s.
-            try:
-                (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
-                    missing_ok=True,
-                )
-                _log.event("ask.inbox_unlinked_inline", id=msg.id)
-            except Exception as e:
-                _log.event("ask.inbox_unlink_failed", id=msg.id, error=repr(e))
-
             # Fix E: post-inject verify + force Enter. If the inject
             # didn't submit (long body + chunked keystroke race, or TUI
             # treated trailing newline as paste-end instead of submit),
@@ -663,6 +648,14 @@ async def _ask_async(
             # (compose-only extraction misses multi-line bodies that have
             # overflowed onto the chrome below the ❯ line), then forcibly
             # send Enter to push it through.
+            #
+            # ``delivered_ok`` gates the inbox unlink below: we only drop
+            # the durable mailbox copy once delivery is CONFIRMED. If the
+            # body is still stuck after retries, we KEEP the file so the
+            # receiver's drain hook can recover it — losing the message
+            # entirely (the old eager-unlink bug) is worse than the rare
+            # double-delivery the unlink was meant to avoid.
+            delivered_ok = True
             try:
                 time.sleep(0.5)
                 pane_after = osa_capture(sid)
@@ -684,14 +677,31 @@ async def _ask_async(
                             )
                             recovered = True
                             break
+                    delivered_ok = recovered
                     if not recovered:
                         _log.event(
                             "ask.recovery_failed_still_stuck",
                             id=msg.id,
-                            warning="body remains after 3 Enter retries",
+                            warning="body stuck after 3 Enter retries; "
+                                    "keeping inbox file for hook recovery",
                         )
             except Exception as e:
+                # Couldn't verify — assume delivered (preserve prior
+                # behaviour) rather than risk duplicate delivery.
                 _log.event("ask.verify_skipped", id=msg.id, error=repr(e))
+
+            # Delivery confirmed → remove the inbox file now so the
+            # receiver's UserPromptSubmit hook can't re-deliver the same
+            # message as attached context. If NOT confirmed, deliberately
+            # leave the file in place for hook recovery.
+            if delivered_ok:
+                try:
+                    (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
+                        missing_ok=True,
+                    )
+                    _log.event("ask.inbox_unlinked_inline", id=msg.id)
+                except Exception as e:
+                    _log.event("ask.inbox_unlink_failed", id=msg.id, error=repr(e))
             if local_saved:
                 # 0.15s — Claude Code commits Enter ~100-150ms.
                 time.sleep(0.15)
@@ -715,8 +725,12 @@ async def _ask_async(
                 # No settling sleep — guard catches stale-echo
                 # snapshots, and the next sender's snapshot can
                 # tolerate transient repaint.
-            return local_saved, True
+            return local_saved, delivered_ok
 
+    # Default False so an exception inside the thread leaves us on the
+    # safe "file-fallback" path (inbox file kept for hook recovery)
+    # instead of raising NameError below.
+    saved_compose, delivered_via_keystroke = "", False
     try:
         saved_compose, delivered_via_keystroke = await asyncio.to_thread(
             _acquire_and_run,

@@ -278,6 +278,45 @@ def _screen_compose_is_empty(screen: str) -> bool:
     return False
 
 
+def _screen_user_is_typing(screen: str) -> bool:
+    """True iff the compose box shows a ❯ prompt with NON-empty text —
+    i.e. the user has half-typed a message we must not clobber.
+
+    This is deliberately distinct from "no ❯ prompt visible at all"
+    (which means Claude is mid-turn / working — safe to queue a wake).
+    Used by the starvation escape to force-wake a perpetually-busy pane
+    WITHOUT risking a user's in-progress compose.
+    """
+    if not screen:
+        return False  # no signal → not "user typing"; let starvation decide
+    for line in reversed(screen.splitlines()[-25:]):
+        m = _COMPOSE_LINE.search(line)
+        if not m:
+            continue
+        rest = m.group(1).strip().strip("\x00 ").strip()
+        return rest != ""
+    return False
+
+
+def _wake_action(screen: str, starving_waited: float, timeout: float) -> str:
+    """Pure decision for a pane that has pending inbox mail.
+
+    Returns one of:
+      - ``"wake"``         idle at empty ❯ prompt → safe normal wake
+      - ``"skip-typing"``  user has half-typed text → never inject
+      - ``"wake-starved"`` Claude mid-turn and oldest msg waited
+                           ``>= timeout`` → force a wake (the "." queues)
+      - ``"wait"``         Claude mid-turn but not yet starved → hold
+    """
+    if _screen_compose_is_empty(screen):
+        return "wake"
+    if _screen_user_is_typing(screen):
+        return "skip-typing"
+    if starving_waited >= timeout:
+        return "wake-starved"
+    return "wait"
+
+
 def _wake(session_id: str) -> bool:
     """Inject the wake text + Enter via osascript. Single CR sent
     separately so it lands outside iTerm's bracket-paste envelope and
@@ -360,6 +399,15 @@ def main(argv: list[str] | None = None) -> int:
     # multi-second LLM processing window.
     last_wake: dict[str, float] = {}
     COOLDOWN = 6.0  # seconds — must be > 1 LLM round trip
+    # Starvation escape: a perpetually-busy pane (an orchestrator that's
+    # always mid-turn) never shows an empty ❯ prompt, so the normal
+    # compose-empty gate would skip it forever and its inbox starves.
+    # If the oldest pending message has waited this long AND the pane is
+    # "working" (no ❯ prompt) rather than "user typing" (❯ + text), we
+    # force-wake: the injected "." just queues and fires the drain hook
+    # once the current turn ends.
+    STARVATION_TIMEOUT = 90.0  # seconds
+    starving_since: dict[str, float] = {}
     _log(f"watchdog start interval={args.interval}s self_sid={self_sid[:8] or '(unknown)'}")
 
     def _scan_once() -> int:
@@ -407,15 +455,30 @@ def main(argv: list[str] | None = None) -> int:
 
         screens = _capture_all() if candidates else {}
         for label, sid, files, now in candidates:
-            if _screen_compose_is_empty(screens.get(sid, "")):
+            screen = screens.get(sid, "")
+            # How long has the oldest pending msg been waiting while busy?
+            waited = now - starving_since.get(label, now)
+            action = _wake_action(screen, waited, STARVATION_TIMEOUT)
+
+            if action == "skip-typing":
+                # Half-typed user message — never inject. Reset the
+                # starvation clock so we don't pounce the instant they pause.
+                _log(f"skip-busy(user-typing) label={label} ({len(files)} pending msg)")
+                starving_since.pop(label, None)
+            elif action == "wait":
+                # Claude mid-turn, not yet starved — start/continue clock.
+                first = starving_since.setdefault(label, now)
+                _log(f"skip-busy(working {now - first:.0f}/{STARVATION_TIMEOUT:.0f}s) "
+                     f"label={label} ({len(files)} pending msg)")
+            else:  # "wake" or "wake-starved"
                 if _wake(sid):
-                    _log(f"woke label={label} for {len(files)} pending msg")
+                    tag = "woke" if action == "wake" else f"woke(starvation {waited:.0f}s)"
+                    _log(f"{tag} label={label} for {len(files)} pending msg")
                     woken += 1
                     last_wake[label] = now
+                    starving_since.pop(label, None)
                 else:
-                    _log(f"wake-attempt-failed label={label}")
-            else:
-                _log(f"skip-busy label={label} ({len(files)} pending msg)")
+                    _log(f"wake-attempt-failed label={label} (action={action})")
         return woken
 
     if args.once:

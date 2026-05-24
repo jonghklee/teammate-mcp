@@ -1,7 +1,21 @@
 # Spec: Ping-pong 회복력 (배달된 메일이 굶지 않게)
 
-상태: **DRAFT — 미구현.** 이 문서는 "근본 해결"안을 기록만 한다. 구현/검증은
-별도 단계에서 진행하며, 아래 가설이 실제로 문제를 해결하는지 확인 후 채택한다.
+상태: **구현됨 (라이브 활성화는 사용자 확인 대기).**
+- **A. Stop 훅**: `hooks/stop_inbox_drain.py` 신설 + `bin/install-claude` 2.7
+  + `templates/settings.claude.json`에 등록. ⚠️ 라이브 `~/.claude/settings.json`엔
+  아직 안 넣음 — auto-continue가 진짜 해결인지 미검증 + 기존 notify Stop 훅과
+  공존 필요. `install-claude` 실행 시 활성화됨.
+- **B. watcher 굶주림 탈출구**: `watcher.py` `_screen_user_is_typing` +
+  `_wake_action` + `_scan_once` 통합. **즉시 적용 (watchdog 재시작 시).**
+- **C. inject 유실 가드**: `server.py` — unlink를 verify 이후로 이동, 전달
+  확인 시에만 삭제. **즉시 적용.**
+
+테스트: `test_watcher.py`(+4), `test_stop_hook.py`(+4), `test_iterm`/기존
+`_body_stuck` 커버. 전체 84 passed.
+
+---
+
+(원본 DRAFT 노트 — 설계 근거)
 
 작성 근거: 2026-05-24 진단 세션. 사용자 호소 = "멈춰있다 / 끝나고 보고가
 안 온다 / ping pong이 안돼".

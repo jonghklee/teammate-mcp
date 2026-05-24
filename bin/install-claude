@@ -176,6 +176,40 @@ PY
     fi
 fi
 
+# ---- 2.7  Install Stop hook (inbox drain on turn end — ping-pong) ---------
+# Fires when a Claude pane finishes a turn: if mail is pending it blocks
+# the stop and feeds the messages back, so a perpetually-busy pane still
+# processes replies without the user typing. Loop-safe via stop_hook_active.
+STOP_HOOK_SRC="$REPO_ROOT/hooks/stop_inbox_drain.py"
+if [[ ! -x "$STOP_HOOK_SRC" ]]; then
+    echo "→ skip Stop hook: $STOP_HOOK_SRC not executable (chmod +x?)"
+elif [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    echo "→ skip Stop hook: $CLAUDE_SETTINGS missing"
+else
+    if grep -qF "stop_inbox_drain.py" "$CLAUDE_SETTINGS"; then
+        echo "→ skip: Stop hook already in $CLAUDE_SETTINGS"
+    else
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "→ DRY: would add Stop hook to $CLAUDE_SETTINGS"
+        else
+            backup="${CLAUDE_SETTINGS}.bak.$(date +%s)"
+            cp "$CLAUDE_SETTINGS" "$backup"
+            python3 - "$CLAUDE_SETTINGS" "$STOP_HOOK_SRC" <<'PY'
+import json, sys, pathlib
+path, hook = sys.argv[1], sys.argv[2]
+data = json.loads(pathlib.Path(path).read_text())
+data.setdefault("hooks", {})
+stop = data["hooks"].setdefault("Stop", [])
+# Append alongside any existing Stop hooks (e.g. a notify hook) — Stop
+# is an array of { hooks: [{type,command,...}] } groups.
+stop.append({"hooks": [{"type": "command", "command": hook}]})
+pathlib.Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+PY
+            echo "→ added Stop hook to $CLAUDE_SETTINGS (backup: $(basename "$backup"))"
+        fi
+    fi
+fi
+
 # ---- 2.6  Install PreToolUse hook (blocks runaway Bash polling loops) -----
 if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
     :

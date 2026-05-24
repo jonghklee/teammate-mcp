@@ -147,6 +147,7 @@ def test_spawn_default_mode_is_split_of_caller_pane(tmp_path, monkeypatch):
 
     monkeypatch.delenv("TEAMMATE_LABEL", raising=False)
     monkeypatch.setenv("TERM_SESSION_ID", "w1t0p1:CALLER-SID")
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: {})  # no prior children
     monkeypatch.setattr(cli, "_build_spawn_applescript", fake_build)
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
     monkeypatch.setattr(cli, "_append_spawn_ledger", lambda record: None)
@@ -175,6 +176,7 @@ def test_spawn_default_anchor_prefers_teammate_label_over_term_session(tmp_path,
 
     monkeypatch.setenv("TEAMMATE_LABEL", "claude3")
     monkeypatch.setenv("TERM_SESSION_ID", "w9t9p9:WRONG-BASH-SID")
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: {})  # no prior children
     monkeypatch.setattr(
         registry, "lookup",
         lambda label: {"session_id": "w0t0p0:REAL-CLAUDE3-SID"} if label == "claude3" else None,
@@ -243,6 +245,72 @@ def test_spawn_screen_region_forces_window_over_default_split(tmp_path, monkeypa
     assert rc == 0
     assert captured["mode"] == "window"
     assert captured["bounds"] == (0, 0, 100, 100)
+
+
+# --- SORANO-style stacking placement (the spawn default) ----------------
+
+def test_auto_placement_first_child_splits_caller(monkeypatch):
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: {})
+    monkeypatch.setattr(registry, "all_labels", lambda: {})
+    assert cli._auto_placement("CALLER") == ("split-v", "CALLER")
+
+
+def test_auto_placement_no_caller_returns_window():
+    assert cli._auto_placement("") == ("window", "")
+
+
+def test_auto_placement_subsequent_child_stacks_under_last_live(monkeypatch):
+    ledger = {
+        "w1": {"session_id": "SID-W1", "spawner_session_id": "CALLER", "spawned_at": 1},
+        "w2": {"session_id": "SID-W2", "spawner_session_id": "CALLER", "spawned_at": 2},
+        "x":  {"session_id": "SID-X",  "spawner_session_id": "OTHER",  "spawned_at": 3},
+    }
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: ledger)
+    monkeypatch.setattr(registry, "all_labels", lambda: {
+        "w1": {"session_id": "SID-W1"},
+        "w2": {"session_id": "SID-W2"},
+        "x":  {"session_id": "SID-X"},
+    })
+    # split-h, anchored under the LAST (most recent) live child of CALLER —
+    # the child of OTHER is ignored.
+    assert cli._auto_placement("CALLER") == ("split-h", "SID-W2")
+
+
+def test_auto_placement_ignores_dead_children(monkeypatch):
+    ledger = {"w1": {"session_id": "SID-W1", "spawner_session_id": "CALLER", "spawned_at": 1}}
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: ledger)
+    monkeypatch.setattr(registry, "all_labels", lambda: {})  # w1 no longer alive
+    # No LIVE children → back to first-child split-v off the caller.
+    assert cli._auto_placement("CALLER") == ("split-v", "CALLER")
+
+
+def test_spawn_default_stacks_under_last_child(tmp_path, monkeypatch):
+    """No --mode/--anchor + an existing live child → split-h under it."""
+    captured = {}
+
+    def fake_build(mode, shell_line, bounds=None, anchor_session_id=""):
+        captured["mode"] = mode
+        captured["anchor_session_id"] = anchor_session_id
+        return "return \"SID-NEW\""
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout="SID-NEW\n", stderr="")
+
+    monkeypatch.delenv("TEAMMATE_LABEL", raising=False)
+    monkeypatch.setenv("TERM_SESSION_ID", "w1t0p1:CALLER")
+    monkeypatch.setattr(cli, "_load_spawn_ledger", lambda: {
+        "w1": {"session_id": "SID-W1", "spawner_session_id": "CALLER", "spawned_at": 1},
+    })
+    monkeypatch.setattr(registry, "all_labels", lambda: {"w1": {"session_id": "SID-W1"}})
+    monkeypatch.setattr(cli, "_build_spawn_applescript", fake_build)
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(cli, "_append_spawn_ledger", lambda record: None)
+
+    rc = cli._cmd_spawn(["w2", "zsh", "--cwd", str(tmp_path), "--no-wait"])
+
+    assert rc == 0
+    assert captured["mode"] == "split-h"            # stacked, not split-v
+    assert captured["anchor_session_id"] == "SID-W1"  # under the last live child
 
 
 def test_spawn_split_anchor_option_resolves_registered_label(tmp_path, monkeypatch):

@@ -344,6 +344,41 @@ def _resolve_caller_session_id() -> str:
     return sid.upper()
 
 
+def _auto_placement(caller_sid: str) -> tuple[str, str]:
+    """SORANO-style child placement, adopted as the spawn DEFAULT.
+
+    Mirrors ``00_SORANO/infra/scripts/spawn-child.sh``:
+      - first child of this caller  → ``split-v`` off the CALLER pane
+        (a new column to the right),
+      - subsequent children         → ``split-h`` stacked UNDER the last
+        still-alive child this caller spawned.
+
+    "Children of this caller" = ledger entries whose ``spawner_session_id``
+    matches ``caller_sid`` and whose pane is still alive in the registry,
+    ordered by spawn time. Returns ``(mode, anchor_session_id)``. If the
+    caller pane can't be resolved, returns ``("window", "")`` so we never
+    split iTerm's focused pane.
+    """
+    if not caller_sid:
+        return ("window", "")
+    from . import registry as _reg
+    live_sids = {
+        (rec.get("session_id") or "").upper()
+        for rec in _reg.all_labels().values()
+    }
+    caller_up = caller_sid.upper()
+    siblings = [
+        rec for rec in _load_spawn_ledger().values()
+        if (rec.get("spawner_session_id") or "").upper() == caller_up
+        and (rec.get("session_id") or "").upper() in live_sids
+    ]
+    siblings.sort(key=lambda r: r.get("spawned_at") or 0)
+    if not siblings:
+        return ("split-v", caller_sid)
+    last_sid = _normalize_term_session_id(siblings[-1].get("session_id") or "").upper()
+    return ("split-h", last_sid)
+
+
 def _anchor_session_script_prefix(anchor_session_id: str) -> str:
     sid = anchor_session_id.replace("\\", "\\\\").replace('"', '\\"').upper()
     return (
@@ -673,6 +708,23 @@ def _cmd_spawn(argv: list[str]) -> int:
             # signal; it overrides the default split layout.
             mode = "window"
 
+    # Resolve the caller pane once (used for placement + ledger).
+    caller_sid = _resolve_caller_session_id()
+
+    # DEFAULT placement (SORANO algorithm, ported from
+    # 00_SORANO/infra/scripts/spawn-child.sh): when the caller gave
+    # neither --mode nor --anchor, stack children — the first child
+    # splits the caller pane (split-v, new right column), and each
+    # subsequent child splits-h UNDER the last live child this caller
+    # spawned. Explicit --mode / --anchor / window override this.
+    if not mode_explicit and not anchor_arg and mode != "window":
+        mode, auto_anchor = _auto_placement(caller_sid)
+        if auto_anchor:
+            anchor_arg = auto_anchor
+        print(f"[spawn] auto-placement → mode={mode}"
+              f"{' anchor=' + auto_anchor[:8] if auto_anchor else ''}",
+              file=sys.stderr)
+
     anchor_session_id = ""
     if mode in ("tab", "split", "split-v", "split-h"):
         from . import registry as _reg
@@ -765,6 +817,7 @@ def _cmd_spawn(argv: list[str]) -> int:
             "mode": mode,
             "spawned_at": time.time(),
             "spawner_pid": os.getpid(),
+            "spawner_session_id": caller_sid,
         })
     except Exception:
         pass  # ledger is best-effort; not having it just means `despawn` falls back to registry lookup

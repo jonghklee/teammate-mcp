@@ -848,7 +848,7 @@ async def inbox(label: str = "") -> list[dict]:
 
 @mcp.tool()
 async def spawn(label: str, command: str, cwd: str = "",
-                message: str = "", mode: str = "split-v",
+                message: str = "", mode: str = "auto",
                 wait_s: int = 20, yolo: bool = False,
                 screen: str = "", bounds: str = "") -> str:
     """Spawn a new iTerm pane with a label, then optionally send an
@@ -859,11 +859,14 @@ async def spawn(label: str, command: str, cwd: str = "",
         command:  Shell command to run (e.g. "claude" or "codex").
         cwd:      Working directory. Tilde-expanded. Defaults to caller's cwd.
         message:  Optional first ask to send after registration.
-        mode:     "split-v" (default) | "split-h" | "tab" | "window".
-                  The default splits the CALLER's own pane (the pane this
-                  agent runs in — resolved via TEAMMATE_LABEL/registry,
-                  not iTerm's focused pane). Falls back to "window" if the
-                  caller pane can't be resolved. Use "window" for a
+        mode:     "auto" (default) | "split-v" | "split-h" | "tab" | "window".
+                  "auto" uses SORANO-style stacking placement: the FIRST
+                  child splits the CALLER's pane (split-v, new right
+                  column), each subsequent child splits-h UNDER the last
+                  live child this caller spawned. Resolved via
+                  TEAMMATE_LABEL/registry — never iTerm's focused pane;
+                  falls back to "window" if the caller pane is unknown.
+                  Pass an explicit mode to override. Use "window" for a
                   free-standing window (e.g. with screen/bounds).
         wait_s:   Max seconds to wait for registration. Default 20.
         yolo:     If True and command starts with ``codex``, automatically
@@ -880,10 +883,10 @@ async def spawn(label: str, command: str, cwd: str = "",
     args = ["teammate-mcp", "spawn", label, command]
     if cwd:
         args += ["--cwd", cwd]
-    # Always forward --mode: the CLI's own default is now "split-v", so
-    # omitting it no longer means "window". Forward explicitly so the
-    # caller's chosen mode (including "window") is honored.
-    if mode:
+    # "auto" → omit --mode so the CLI runs its default SORANO stacking
+    # placement (mode_explicit stays False). Any explicit mode is
+    # forwarded and honored verbatim (including "window").
+    if mode and mode != "auto":
         args += ["--mode", mode]
     if wait_s and wait_s != 20:
         args += ["--wait-s", str(int(wait_s))]

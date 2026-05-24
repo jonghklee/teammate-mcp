@@ -77,14 +77,39 @@ async def test_ask_mailbox_only_writes_inbox_without_injecting(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_ask_defaults_to_mailbox_only_without_injecting(tmp_path, monkeypatch):
+async def test_ask_defaults_to_inject(tmp_path, monkeypatch):
+    # Default delivery is now keystroke-inject (immediate) when neither
+    # mailbox_only nor TEAMMATE_MCP_MAILBOX_ONLY is set.
+    monkeypatch.delenv("TEAMMATE_MCP_MAILBOX_ONLY", raising=False)
+    monkeypatch.setattr(server, "MAILBOX_ROOT", tmp_path / "mailbox")
+    monkeypatch.setenv("TEAMMATE_LABEL", "sender")
+    monkeypatch.setattr(server, "_resolve_target_session_id", lambda target, fallback: "SID-TARGET")
+    monkeypatch.setattr(server, "osa_session_alive", lambda sid: True)
+    monkeypatch.setattr(server, "osa_extract_compose", lambda sid: "")
+    monkeypatch.setattr(server, "osa_send_raw", lambda *a, **k: None)
+    monkeypatch.setattr(server, "osa_capture", lambda sid: "")
+    injected = {}
+    monkeypatch.setattr(server, "osa_clear_and_inject",
+                        lambda sid, clear_count, body: injected.update(body=body))
+
+    answer = await server._ask_async("hello", target="receiver")
+
+    assert "hello" in injected.get("body", "")   # injected by default
+    assert answer.startswith("sent:")            # not "queued mailbox-only"
+
+
+@pytest.mark.asyncio
+async def test_env_forces_mailbox_only(tmp_path, monkeypatch):
+    # TEAMMATE_MCP_MAILBOX_ONLY=1 reverts the default to pure mailbox
+    # (no keystroke injection) — the global kill-switch.
+    monkeypatch.setenv("TEAMMATE_MCP_MAILBOX_ONLY", "1")
     monkeypatch.setattr(server, "MAILBOX_ROOT", tmp_path / "mailbox")
     monkeypatch.setenv("TEAMMATE_LABEL", "sender")
     monkeypatch.setattr(server, "_resolve_target_session_id", lambda target, fallback: "SID-TARGET")
     monkeypatch.setattr(server, "osa_session_alive", lambda sid: True)
 
     def fail_inject(*args, **kwargs):
-        raise AssertionError("default ask must not inject keystrokes")
+        raise AssertionError("mailbox-only must not inject keystrokes")
 
     monkeypatch.setattr(server, "osa_clear_and_inject", fail_inject)
     monkeypatch.setattr(server, "osa_send_raw", fail_inject)

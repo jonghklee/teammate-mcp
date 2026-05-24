@@ -40,22 +40,9 @@ def test_ask_mailbox_only_env_passes_through(monkeypatch):
     assert captured["mailbox_only"] is True
 
 
-def test_ask_defaults_to_mailbox_only_without_inject_env(monkeypatch):
-    captured = {}
-
-    async def fake_ask_async(**kwargs):
-        captured.update(kwargs)
-        return "queued mailbox-only message for receiver"
-
-    monkeypatch.setattr(server, "_ask_async", fake_ask_async)
-
-    rc = cli._cmd_ask(["receiver", "hello"])
-
-    assert rc == 0
-    assert captured["mailbox_only"] is True
-
-
-def test_ask_inject_env_opts_into_keystroke_delivery(monkeypatch):
+def test_ask_defaults_to_inject(monkeypatch):
+    # Default delivery is now keystroke-inject (mailbox_only=False) when
+    # neither --mailbox-only nor TEAMMATE_MCP_MAILBOX_ONLY is set.
     captured = {}
 
     async def fake_ask_async(**kwargs):
@@ -63,9 +50,25 @@ def test_ask_inject_env_opts_into_keystroke_delivery(monkeypatch):
         return "sent: job_id=1 to receiver (keystroke)"
 
     monkeypatch.setattr(server, "_ask_async", fake_ask_async)
-    monkeypatch.setenv("TEAMMATE_INJECT", "1")
+    monkeypatch.delenv("TEAMMATE_MCP_MAILBOX_ONLY", raising=False)
 
     rc = cli._cmd_ask(["receiver", "hello"])
 
     assert rc == 0
     assert captured["mailbox_only"] is False
+
+
+def test_ask_mailbox_only_flag_opts_out_of_inject(monkeypatch):
+    captured = {}
+
+    async def fake_ask_async(**kwargs):
+        captured.update(kwargs)
+        return "queued mailbox-only message for receiver"
+
+    monkeypatch.setattr(server, "_ask_async", fake_ask_async)
+    monkeypatch.delenv("TEAMMATE_MCP_MAILBOX_ONLY", raising=False)
+
+    rc = cli._cmd_ask(["--mailbox-only", "receiver", "hello"])
+
+    assert rc == 0
+    assert captured["mailbox_only"] is True

@@ -436,19 +436,29 @@ async def _ask_async(
     timeout: int = 300,
     safe_max_wait: float = 30.0,
     wait: bool = False,
-    mailbox_only: bool = True,
+    mailbox_only: Optional[bool] = None,
 ) -> str:
     """Drive one ask: enqueue → push (osascript) → return immediately.
 
-    Always async (mailbox-based). The message is persisted to
-    ``~/.teammate-mcp/mailbox/<target>/inbox/<job_id>.json`` and the
-    receiver replies via its own reverse async ask. Sync mode was
-    removed — see CLI help.
+    Always async. The message is persisted to
+    ``~/.teammate-mcp/mailbox/<target>/inbox/<job_id>.json``; by default
+    we ALSO keystroke-inject it into the receiver's compose for immediate
+    delivery (``mailbox_only=False``). The receiver replies via its own
+    reverse async ask.
+
+    ``mailbox_only`` resolution when not passed explicitly (``None``):
+    keystroke-inject by default; set ``TEAMMATE_MCP_MAILBOX_ONLY=1`` to
+    fall back to pure mailbox + hook/watcher delivery globally.
 
     The ``wait`` kwarg is accepted for backwards compatibility with
     older callers but is ignored: every ask is async.
     """
     _ = wait  # accepted-but-ignored, see docstring
+    if mailbox_only is None:
+        mailbox_only = (
+            os.environ.get("TEAMMATE_MCP_MAILBOX_ONLY", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
     addressee = target or fallback_agent or "<unspecified>"
     # Resolve `from_agent` in priority order:
     #   1. explicit env var (TEAMMATE_LABEL) — wrappers may set this
@@ -640,21 +650,29 @@ async def _ask_async(
                            id=msg.id, error=repr(e))
                 return local_saved, False
 
-            # Fix E: post-inject verify + force Enter. If the inject
-            # didn't submit (long body + chunked keystroke race, or TUI
-            # treated trailing newline as paste-end instead of submit),
-            # our message header is still visible in the pane and the
-            # receiver is NOT processing it. Detect via full-pane capture
-            # (compose-only extraction misses multi-line bodies that have
-            # overflowed onto the chrome below the ❯ line), then forcibly
-            # send Enter to push it through.
-            #
-            # ``delivered_ok`` gates the inbox unlink below: we only drop
-            # the durable mailbox copy once delivery is CONFIRMED. If the
-            # body is still stuck after retries, we KEEP the file so the
-            # receiver's drain hook can recover it — losing the message
-            # entirely (the old eager-unlink bug) is worse than the rare
-            # double-delivery the unlink was meant to avoid.
+            # The inject's Enter fires the receiver's UserPromptSubmit hook
+            # almost immediately; if the inbox file is still present the
+            # hook re-delivers the SAME message as attached context
+            # (double-delivery — pervasive now that inject is the default
+            # path). So unlink eagerly here. We RE-CREATE the file below
+            # only if post-inject verification proves the body never
+            # actually submitted — keeping the durable copy for recovery
+            # without the silent loss the old unconditional eager-unlink
+            # caused.
+            try:
+                (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
+                    missing_ok=True,
+                )
+                _log.event("ask.inbox_unlinked_inline", id=msg.id)
+            except Exception as e:
+                _log.event("ask.inbox_unlink_failed", id=msg.id, error=repr(e))
+
+            # Fix E: post-inject verify + force Enter. If the inject didn't
+            # submit (long/multiline body, or the TUI treated the trailing
+            # newline as paste-end), the body is still visible and the
+            # receiver is NOT processing it. Detect, retry Enter, and if
+            # it's STILL stuck, recreate the inbox file so a hook/watcher
+            # can recover it (loss is worse than a rare double-delivery).
             delivered_ok = True
             try:
                 time.sleep(0.5)
@@ -679,29 +697,22 @@ async def _ask_async(
                             break
                     delivered_ok = recovered
                     if not recovered:
-                        _log.event(
-                            "ask.recovery_failed_still_stuck",
-                            id=msg.id,
-                            warning="body stuck after 3 Enter retries; "
-                                    "keeping inbox file for hook recovery",
-                        )
+                        # Never submitted → restore the durable copy we
+                        # eagerly removed so it's recoverable.
+                        try:
+                            _write_inbox(addressee, inbox_record)
+                            _log.event(
+                                "ask.inbox_recreated_after_stuck", id=msg.id,
+                                warning="body stuck after 3 Enter retries; "
+                                        "inbox file restored for recovery",
+                            )
+                        except Exception as e:
+                            _log.event("ask.inbox_recreate_failed",
+                                       id=msg.id, error=repr(e))
             except Exception as e:
-                # Couldn't verify — assume delivered (preserve prior
-                # behaviour) rather than risk duplicate delivery.
+                # Couldn't verify — leave it unlinked (assume delivered)
+                # rather than risk duplicate delivery on the common path.
                 _log.event("ask.verify_skipped", id=msg.id, error=repr(e))
-
-            # Delivery confirmed → remove the inbox file now so the
-            # receiver's UserPromptSubmit hook can't re-deliver the same
-            # message as attached context. If NOT confirmed, deliberately
-            # leave the file in place for hook recovery.
-            if delivered_ok:
-                try:
-                    (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
-                        missing_ok=True,
-                    )
-                    _log.event("ask.inbox_unlinked_inline", id=msg.id)
-                except Exception as e:
-                    _log.event("ask.inbox_unlink_failed", id=msg.id, error=repr(e))
             if local_saved:
                 # 0.15s — Claude Code commits Enter ~100-150ms.
                 time.sleep(0.15)
@@ -771,8 +782,11 @@ async def ask(question: str, target: str = "", timeout: int = 300, wait: bool = 
       * a session UUID prefix (≥ 6 chars).
 
     The message is persisted to ``~/.teammate-mcp/mailbox/<target>/inbox/``
-    and the receiver's ``UserPromptSubmit`` hook drains it on its next
-    user prompt. The receiver replies via a reverse async ``ask``.
+    AND, by default, keystroke-injected into the receiver's compose for
+    immediate delivery. If the inject can't submit (or is disabled via
+    ``TEAMMATE_MCP_MAILBOX_ONLY=1``), the durable mailbox copy is drained
+    by the receiver's ``UserPromptSubmit`` hook / watchdog / Stop hook
+    instead. The receiver replies via a reverse async ``ask``.
     Caller is never blocked, receiver's compose box is never corrupted.
 
     The ``wait`` parameter is accepted for backwards compatibility but

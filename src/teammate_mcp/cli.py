@@ -1541,20 +1541,15 @@ def _cmd_ask(argv: list[str]) -> int:
     """
     body_from_stdin = False
     body_from_file = None
-    inject_requested = os.environ.get("TEAMMATE_INJECT", "").strip().lower() in (
+    # Keystroke-inject is the default delivery now (immediate). Opt OUT
+    # of injection (pure mailbox + hook/watcher) via --mailbox-only or
+    # TEAMMATE_MCP_MAILBOX_ONLY=1.
+    mailbox_only = os.environ.get("TEAMMATE_MCP_MAILBOX_ONLY", "").strip().lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
-    mailbox_only = not inject_requested
-    if os.environ.get("TEAMMATE_MCP_MAILBOX_ONLY", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        mailbox_only = True
     # Two-pass: extract flags from anywhere in argv, leaving positional
     # args (label + question words) intact. Deprecated sync flags are
     # silently consumed so old callers don't error out.

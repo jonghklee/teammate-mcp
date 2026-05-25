@@ -157,3 +157,69 @@ async def test_injected_ask_prompt_recommends_mcp_reply_not_bash(tmp_path, monke
 
     assert "mcp__teammate__ask(target='sender'" in captured["body"]
     assert "teammate-mcp ask sender" not in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_inject_waits_for_compose_to_stabilise_then_injects(tmp_path, monkeypatch):
+    # User is typing: compose changes for a few polls, then settles.
+    # Inject should WAIT for the pause, then deliver (not abort).
+    monkeypatch.delenv("TEAMMATE_MCP_MAILBOX_ONLY", raising=False)
+    monkeypatch.setattr(server, "MAILBOX_ROOT", tmp_path / "mailbox")
+    monkeypatch.setenv("TEAMMATE_LABEL", "sender")
+    monkeypatch.setattr(server, "_resolve_target_session_id", lambda target, fallback: "SID-TARGET")
+    monkeypatch.setattr(server, "osa_session_alive", lambda sid: True)
+    monkeypatch.setattr(server.time, "sleep", lambda *a: None)  # speed up the poll
+    monkeypatch.setattr(server, "osa_send_raw", lambda *a, **k: None)
+    monkeypatch.setattr(server, "osa_send_text", lambda *a, **k: None)
+    monkeypatch.setattr(server, "osa_capture", lambda sid: "")
+
+    # compose: "a" → "ab" → "abc" → stable at "abc"
+    seq = ["a", "ab", "abc"]
+    calls = {"n": 0}
+
+    def fake_extract(sid):
+        i = calls["n"]; calls["n"] += 1
+        return seq[i] if i < len(seq) else "abc"
+
+    monkeypatch.setattr(server, "osa_extract_compose", fake_extract)
+
+    injected = {}
+    monkeypatch.setattr(server, "osa_clear_and_inject",
+                        lambda sid, clear_count, body: injected.update(body=body))
+
+    answer = await server._ask_async("hello", target="receiver")
+
+    assert "hello" in injected.get("body", "")   # waited, then injected
+    assert answer.startswith("sent:")
+    assert calls["n"] >= 3                         # it actually polled
+
+
+@pytest.mark.asyncio
+async def test_inject_falls_back_to_mailbox_if_typing_never_settles(tmp_path, monkeypatch):
+    # User never pauses within the cap → fall back to mailbox (no inject).
+    import itertools
+    monkeypatch.delenv("TEAMMATE_MCP_MAILBOX_ONLY", raising=False)
+    monkeypatch.setenv("TEAMMATE_INJECT_STABILISE_WAIT", "0.4")
+    monkeypatch.setattr(server, "MAILBOX_ROOT", tmp_path / "mailbox")
+    monkeypatch.setenv("TEAMMATE_LABEL", "sender")
+    monkeypatch.setattr(server, "_resolve_target_session_id", lambda target, fallback: "SID-TARGET")
+    monkeypatch.setattr(server, "osa_session_alive", lambda sid: True)
+    monkeypatch.setattr(server.time, "sleep", lambda *a: None)
+    ticks = itertools.count(0, 0.3)  # deterministic clock: 0, 0.3, 0.6, ...
+    monkeypatch.setattr(server.time, "monotonic", lambda: next(ticks))
+
+    # compose changes every snapshot — never stabilises
+    counter = itertools.count()
+    monkeypatch.setattr(server, "osa_extract_compose", lambda sid: f"typing{next(counter)}")
+
+    def must_not_inject(*a, **k):
+        raise AssertionError("must not inject while user keeps typing")
+
+    monkeypatch.setattr(server, "osa_clear_and_inject", must_not_inject)
+    monkeypatch.setattr(server, "osa_send_raw", must_not_inject)
+
+    answer = await server._ask_async("hello", target="receiver")
+
+    assert "file-fallback" in answer            # deferred to mailbox/hook
+    inbox = list((tmp_path / "mailbox" / "receiver" / "inbox").glob("*.json"))
+    assert len(inbox) == 1                       # durable copy kept for hook

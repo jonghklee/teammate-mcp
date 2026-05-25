@@ -601,23 +601,44 @@ async def _ask_async(
 
             # Fix B: mid-typing detection. Two snapshots 300 ms apart;
             # if the compose buffer changed in between, the user is
-            # actively typing into the target pane. Inject would race
-            # with their keystrokes and could leave the TUI in a
-            # corrupt half-paste state — the "this one pane freezes
-            # forever" symptom. Mailbox is already written; let the
-            # hook drain it on the user's next prompt instead.
+            # actively typing into the target pane. Injecting then would
+            # race their keystrokes and could leave the TUI in a corrupt
+            # half-paste state ("this one pane freezes forever").
+            #
+            # Rather than give up immediately, WAIT for the compose to
+            # stabilise (user pauses) — typing pauses are a few seconds,
+            # so this just defers the inject briefly. A generous cap
+            # (TEAMMATE_INJECT_STABILISE_WAIT, default 20s) protects the
+            # rare "walked away with text in the box" case: if it never
+            # settles we fall back to the mailbox (the hook delivers it
+            # on the user's next prompt). Note: the per-target lock is
+            # held during the wait, so concurrent senders to the SAME
+            # pane queue behind it — fine for short pauses.
+            stabilise_wait = float(
+                os.environ.get("TEAMMATE_INJECT_STABILISE_WAIT", "20")
+            )
             local_saved = osa_extract_compose(sid)
-            time.sleep(0.30)
-            second_snap = osa_extract_compose(sid)
-            if local_saved != second_snap:
-                _log.event(
-                    "ask.user_typing_aborted_inject",
-                    id=msg.id,
-                    before_len=len(local_saved),
-                    after_len=len(second_snap),
-                )
-                return second_snap, False
-            local_saved = second_snap  # stable
+            deadline = time.monotonic() + stabilise_wait
+            waited_for_typing = False
+            while True:
+                time.sleep(0.30)
+                second_snap = osa_extract_compose(sid)
+                if local_saved == second_snap:
+                    break  # stable — empty box, or user paused typing
+                waited_for_typing = True
+                local_saved = second_snap
+                if time.monotonic() >= deadline:
+                    _log.event(
+                        "ask.user_typing_wait_timeout",
+                        id=msg.id,
+                        waited_s=round(stabilise_wait, 1),
+                        len=len(second_snap),
+                    )
+                    return second_snap, False  # fall back to mailbox/hook
+            if waited_for_typing:
+                _log.event("ask.compose_stabilised", id=msg.id,
+                           len=len(local_saved))
+            # local_saved now holds the settled compose text.
 
             clear_count = len(local_saved) + 4 if local_saved else 0
             if local_saved:

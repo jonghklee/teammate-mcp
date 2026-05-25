@@ -9,4 +9,13 @@ mkdir -p "$(dirname $DBG)"
     "$TMM" register-pane "$@"
     echo "register-pane exit=$?"
 } >> "$DBG" 2>&1
+# Export TEAMMATE_LABEL so the sender is always stamped on `teammate-mcp
+# ask`. Claude usually resolves via its long-lived MCP server's session
+# env, but exporting here is a cheap belt-and-suspenders (and mirrors
+# tmcodex, where it is essential — see that file).
+_TM_LABEL=$("$TMM" whoami 2>/dev/null)
+if [ -n "$_TM_LABEL" ] && [[ "$_TM_LABEL" != "("* ]]; then
+    export TEAMMATE_LABEL="$_TM_LABEL"
+    echo "exported TEAMMATE_LABEL=$_TM_LABEL" >> "$DBG"
+fi
 exec claude --dangerously-skip-permissions

@@ -9,4 +9,15 @@ mkdir -p "$(dirname $DBG)"
     "$TMM" register-pane "$@"
     echo "register-pane exit=$?"
 } >> "$DBG" 2>&1
+# Export TEAMMATE_LABEL so the sender is stamped on every `teammate-mcp
+# ask`. CRITICAL for codex: codex carries its exported env into command
+# subprocesses but NOT iTerm's injected TERM_SESSION_ID, so without this
+# codex sends from=unknown and replies can't be routed back. We resolve
+# the label here (still inside the iTerm shell, TERM_SESSION_ID valid)
+# from the registry entry register-pane just wrote.
+_TM_LABEL=$("$TMM" whoami 2>/dev/null)
+if [ -n "$_TM_LABEL" ] && [[ "$_TM_LABEL" != "("* ]]; then
+    export TEAMMATE_LABEL="$_TM_LABEL"
+    echo "exported TEAMMATE_LABEL=$_TM_LABEL" >> "$DBG"
+fi
 exec codex --yolo

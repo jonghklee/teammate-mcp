@@ -1,39 +1,40 @@
 ---
 name: team-register
-description: "Register THIS iTerm pane in teammate-mcp via the CLI (claude1, codex1, codex2, ...). Trigger this on /tmclaude, /tmcodex, /tm, /register, /team-register, or when the user says to tag/register this pane in Korean or English."
+description: Use when the user asks to register, identify or label the current teammate session, including a pane-free Codex thread.
 ---
 
-# team-register (CLI-based)
+# Automatic session setup
 
-The user wants this pane to be addressable by sibling panes through
-the teammate-mcp bridge. Run the registration once via CLI — no MCP
-round-trip required.
+Call MCP `connection_status` first. Current Codex sends its actual threadId in
+request metadata: the server automatically registers and enables idle delivery
+on the first tool call. iTerm sessions are identified at server startup. Report
+the returned address, transport, ready flag and any setup_error. Reconnection
+reuses the address and preserves an explicitly disabled delivery setting.
 
-## Action — exactly these steps
+Do not require the user to run register-pane on every session. If a user chooses
+a custom label, use register_self for a pane or register_mailbox for a thread.
+Do not assign another pane just because its title or cwd is similar.
 
-1. Run this bash command and capture stdout:
+For old running MCP processes, reconnect the teammate server once. Until then a
+fresh actual MCP stdio client can call the updated tools:
 
-   ```bash
-   /Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp register-pane
-   ```
+```sh
+/Users/siheom-yong/programming/teammate-mcp/.venv/bin/python /Users/siheom-yong/programming/teammate-mcp/scripts/mcp_call.py connection_status '{}'
+```
 
-   If the user supplied an explicit label (e.g. "register me as worker"),
-   append it as the first argument:
+If identity is unavailable, inspect TERM_SESSION_ID, CODEX_THREAD_ID and actual
+process ancestry. The explicit register-pane CLI or register_mailbox tool is
+for recovery/older clients, not the normal workflow. Never invent a thread ID.
 
-   ```bash
-   ... register-pane worker
-   ```
+MCP connection alone cannot reveal a pane-free thread before the client sends
+its identity. Automatic setup happens on its first tool call. A missing local
+app-server transport is reported as manual/unavailable, not automatic readiness.
+If the request also asks for a conversation, continue through actual reception.
 
-2. Print the CLI's `✓ registered as <label>` line back to the user.
+## Claude native queue requirement
 
-3. **End the turn. Do not call any MCP tool.**
-
-Re-running on an already-registered pane is safe — the existing label
-is reused.
-
-## Trigger phrases
-
-- `/tmclaude` / `/tmcodex` / `/tm` / `/register` / `/team-register`
-- "이 페인 등록해줘" / "이 페인 태그해줘"
-- "register this pane" / "tag this pane"
-- "register me as <name>" → pass <name> as the first CLI argument
+Claude must be launched with the teammate channel enabled (bin/claude-channel).
+Its own local-development approval is required. The nonce channel handshake
+proves notifications actually reach this session; do not mark ready just because
+MCP tools are connected. A normal old session needs a channel-enabled launch,
+not merely an MCP reconnect. Never clear or submit an existing draft to enable it.

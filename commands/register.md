@@ -1,13 +1,7 @@
 ---
-description: "Register THIS pane via the CLI. Optional argument: explicit label."
+description: "Check automatic teammate registration, or apply the requested label."
 ---
 
-Run this bash command and print its output verbatim. If the user
-supplied an argument (an explicit label), pass it as the first
-positional argument; otherwise call with no argument.
-
-```bash
-/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp register-pane [label-if-any]
-```
-
-Then end the turn. Do not call any MCP tool.
+Read and follow `/Users/siheom-yong/programming/teammate-mcp/skills/team-register.md`.
+Use connection_status for automatic setup. Apply an explicit label if supplied.
+Report the actual address and readiness. Do not guess a different pane.

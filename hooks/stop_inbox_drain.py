@@ -32,6 +32,9 @@ import json
 import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from teammate_mcp.pane_delivery import available_to_hook, hook_delivery_lock
 from typing import Optional
 
 REGISTRY = Path.home() / ".teammate-mcp" / "registry.json"
@@ -80,7 +83,7 @@ def _format_reason(label: str, records: list[dict]) -> str:
         jid = d.get("job_id", "")
         body = d.get("body", "")
         instr = (
-            f"Reply via mcp__teammate__ask(target='{sender}', question='<reply>') "
+            f"Reply via mcp__teammate__reply(job_id='{jid}', label='{label}', question='<reply>') "
             f"— not Bash, not XML tool tags."
         )
         blocks.append(
@@ -111,7 +114,7 @@ def decide(records: list[dict], stop_hook_active: bool,
     return {"decision": "block", "reason": _format_reason(label, selected)}
 
 
-def main() -> int:
+def _main_unlocked() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
@@ -125,7 +128,7 @@ def main() -> int:
     processed = MAILBOX / label / "processed"
     if not inbox.exists():
         return 0
-    files = sorted(inbox.glob("*.json"))
+    files = [p for p in sorted(inbox.glob("*.json")) if available_to_hook(p)]
     if not files:
         return 0
 
@@ -156,6 +159,14 @@ def main() -> int:
     print(json.dumps(out, ensure_ascii=False))
     _log(f"stop-drain blocked label={label} surfaced={moved} reason_len={n}")
     return 0
+
+
+def main() -> int:
+    label = _resolve_label()
+    if not label:
+        return 0
+    with hook_delivery_lock(MAILBOX, label) as acquired:
+        return _main_unlocked() if acquired else 0
 
 
 if __name__ == "__main__":

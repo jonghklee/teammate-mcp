@@ -1,387 +1,123 @@
 # teammate-mcp
 
-> Let **Claude Code** and **OpenAI Codex** panes talk to each other —
-> by **label**, by **iTerm session name**, or by **session id**.
-> N agents, M agents, mix-and-match. No daemon. No `.config` per project.
+Local two-way conversations between Claude Code/iTerm sessions and Codex
+threads. Messages have stable IDs, durable history and correlated replies.
+A transport receipt is distinct from an answer.
 
-```
-┌──────────── iTerm window ─────────────┐
-│ claude  (left)        codex  (right)  │
-│ ───────────────────   ─────────────── │
-│ > implement quoter    > [teammate-mcp │
-│   I'll ask Codex...     ASK ... what  │
-│   ⏺ Codex answered:     is 2+2?]      │
-│      4                  • 4           │
-└───────────────────────────────────────┘
-```
+## Setup
 
-`teammate-mcp` is a tiny MCP server that gives every loaded CLI a
-small toolbox:
-
-- `ask(target, question, timeout)` — primary. `target` is a label, an
-  iTerm session name, or a session-id prefix.
-- `list_panes()` — every live pane + its label/name/id/job/cwd.
-- `register_self(label)` — attach a label to the calling pane at runtime.
-- `broadcast(message, targets=[...])` — push to multiple panes at once.
-- `ask_codex` / `ask_claude` — legacy 1:1 shortcuts; still work when
-  exactly one of each CLI is running.
-
-The server uses the [iTerm2 Python API](https://iterm2.com/python-api/)
-to push the prompt into the target pane and read the reply back via a
-unique marker (`<<DONE_…>>`).
-
-## Why?
-
-Existing multi-agent harnesses fall into two camps:
-
-1. **Heavyweight**: a daemon, per-project config files, opaque session
-   state. Great until something breaks at 2 AM and you can't see why.
-2. **Single-process**: one model orchestrating sub-agents internally,
-   so the user only sees the final answer.
-
-`teammate-mcp` aims for a third option: the two agents are visibly
-running in your terminal *next to each other*, you can read both
-transcripts in real time, and the only "infrastructure" is a few
-hundred lines of Python that pushes text and reads screens.
-
-## Verified bidirectional round trip
-
-Captured live during development on macOS 14, iTerm 3.6.8,
-Claude Code 2.1.119 + Opus 4.7, Codex 0.125.0:
-
-```jsonl
-{"event":"ask.enqueue","id":"…c5d085","from_":"claude","to":"codex","len":49}
-{"event":"ask.send",   "id":"…c5d085","to":"codex","session_id":"7E39032F-…"}
-{"event":"ask.complete","id":"…c5d085","answer_len":3}
-```
-
-The `ask.send` → `ask.complete` interval was **3.0 seconds** for a
-prompt of "What is two plus two? Answer with the digit only" — the bulk
-of which is Codex thinking time, not the bridge. Five consecutive runs
-all closed the loop in 1.5 – 4.5 seconds.
-
-Six independent timing reports captured in `tests/results/` are
-included in the repo so you can audit the numbers yourself.
-
----
-
-## Quick start
-
-### 1. Install
+From this repository:
 
 ```sh
-git clone https://github.com/jonghklee/teammate-mcp.git
-cd teammate-mcp
-uv venv
-uv pip install -e .
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+claude mcp add --scope user teammate -- "$PWD/.venv/bin/teammate-mcp" serve
+codex mcp add teammate -- "$PWD/.venv/bin/teammate-mcp" serve
 ```
 
-### 2a. One-shot Claude Code wiring (recommended)
+For native Claude queue delivery, start Claude with `./bin/claude-channel` and
+accept its local-development channel confirmation. This is required by Claude;
+MCP registration alone does not enable channel input. Keep an existing draft
+untouched by starting a separate channel session for the initial check.
+
+Add the server to each client you use; do not add duplicate entries if it is
+already configured. Existing processes need one teammate MCP reconnect to load
+updated code. `bin/install-claude` additionally installs slash commands and
+inbox hooks while preserving unrelated settings.
+
+Verified environment: macOS, iTerm2, Claude Code 2.1.259, Codex 0.153.4.
+iTerm delivery needs its automation/Python API access. Pane-free automatic
+Codex delivery needs the local app-server control socket and a thread with
+`canAcceptDirectInput=true`. There is no cross-machine relay in this package.
+
+## Automatic registration
+
+Normally no `/register` command is necessary:
+
+- An iTerm session is identified at MCP startup and reuses its existing label.
+- Current Codex attaches `_meta.threadId` to tool calls. The first call registers
+  that exact thread and enables idle delivery. Identity is isolated per request,
+  so a shared MCP process cannot mix concurrent callers through global env state.
+- A standalone Codex CLI without a usable app-server transport keeps its verified
+  physical pane address. No other pane is guessed from title or working directory.
+- A reconnect keeps existing policy, including an explicit automatic-delivery disable.
+
+A pane-free connection cannot be assigned before the client provides its identity;
+its first tool invocation completes setup. Call `connection_status()` to see
+address, transport, readiness, identity source and any setup error. Older clients
+that provide neither pane identity nor thread metadata need explicit recovery
+registration (`register_self` / `register_mailbox`).
+
+## Conversation tools
+
+| Tool | Purpose |
+| --- | --- |
+| `connection_status()` | Automatic setup and this caller's readiness |
+| `list_panes()` | Live panes plus registered Codex mailbox addresses |
+| `ask(target, question)` | Send a question to a registered label |
+| `reply(job_id, question, label?)` | Answer the original sender with question/conversation IDs |
+| `inbox(label?)` | Inspect this session's unprocessed messages |
+| `mark_processed(job_id, target?, reply?)` | Record completion without another message |
+| `mailbox_status(label)` | Inspect queued/waiting/delivered/retry/failed/uncertain state |
+| `retry_delivery(job_id, label?)` | Retry a known failure for the receiving session |
+| `configure_mailbox_delivery(label, policy="idle", enabled=true)` | Configure the owning Codex thread |
+| `register_mailbox(label?, thread_id?)` | Explicit recovery/custom registration |
+| `register_self(label?)` | Explicit registration for the calling environment |
+
+Use explicit target labels. `sent`/`queued` is not a response. A reply includes
+`in_reply_to` and `conversation_id`; an already-sent reply is not sent again.
+If reply receipt writing fails, repeating the reply finishes the receipt without
+repeating the send. Do not turn acknowledgements into an infinite ping-pong loop.
+
+[Registration skill](skills/team-register.md) · [Conversation skill](skills/team-ask.md)
+
+## Delivery and recovery
+
+Codex: idle policy waits for the current turn to finish, then uses app-server
+`turn/start`. Explicit immediate policy uses `turn/steer` for the matching active
+turn. Messages remain durable until processed. A disconnected worker is restarted
+on the next applicable tool call or send. Known pre-dispatch failures retry with
+backoff; an ambiguous dispatch is never blindly resent.
+
+Claude: MCP `notifications/claude/channel` events enter the native execution
+queue independently of the draft editor. A nonce handshake must be received and
+acknowledged by Claude before the channel is marked ready. No draft text is read,
+cleared, restored or submitted. An unsent draft is not in the execution queue;
+peer events can arrive before its later submission. Claude controls scheduling
+of already-running turns and previously submitted messages.
+
+Keyboard transport is disabled by default, including the watchdog. A channel
+that is unavailable leaves mail queued with an explicit waiting state; it does
+not fall back to typing into the editor. The old keyboard path remains only for
+explicit compatibility testing under `TEAMMATE_LEGACY_PANE_INPUT=1`; the channel
+launcher unsets it. See [native channel setup and acceptance](docs/native-claude-channel.md).
+
+State lives under `~/.teammate-mcp/`: registry, per-address inbox/history/processed,
+response records, delivery state and worker health. Inspect
+`run/mailbox-worker.log` and `logs/watchdog.log` for diagnostic errors. A failed
+or uncertain status is not silently called complete. `retry_delivery` refuses
+accepted/ambiguous deliveries; inspect the recipient before any manual resend.
+
+## Fresh MCP connection for old running clients
 
 ```sh
-./bin/install-claude
+.venv/bin/python scripts/mcp_call.py connection_status '{}'
+.venv/bin/python scripts/mcp_call.py ask '{"target":"claude39","question":"Hello"}'
 ```
 
-Idempotent. This single script:
+This is an actual MCP `ClientSession.call_tool` connection, not direct file-based
+message simulation. It preserves the caller's real environment. For complex
+message text use a subprocess argument list and `json.dumps` rather than shell
+string interpolation. A native current Codex tool call also supplies thread
+metadata automatically; the helper is not required after reconnecting.
 
-1. Registers the MCP server with Claude Code (`claude mcp add teammate …`)
-2. Symlinks every `commands/*.md` into `~/.claude/commands/` so the
-   `/ask`, `/tmclaude`, `/tmcodex`, `/team-list`, `/team-register`
-   slash commands work in every Claude Code session
-3. Inserts the `templates/CLAUDE.md` natural-language routing block
-   into `~/.claude/CLAUDE.md` between `<!-- TEAMMATE_MCP_START -->`
-   markers (replaces on re-run, never duplicates; backs up first)
-4. Appends `<repo>/.venv/bin` to your `~/.zshrc` PATH so `teammate-mcp`,
-   `tmclaude`, `tmcodex` resolve without an absolute path
-
-After this, in a *new* shell:
-
-```
-teammate-mcp version          # CLI on PATH
-tmclaude                      # register THIS pane and start Claude Code
-/ask <label> <question>       # inside Claude Code, fast cross-pane ask
-```
-
-Flags: `--dry-run` (preview), `--no-path` (skip the PATH change).
-
-### 2b. Codex (manual)
+## Verification
 
 ```sh
-codex mcp add teammate -- $PWD/.venv/bin/teammate-mcp serve
+.venv/bin/python -m pytest tests --ignore=tests/test_e2e.py -q
 ```
 
-Codex has no slash commands; it picks up `templates/AGENTS.md` from
-your project root automatically.
-
-### 3. Open the panes
-
-You have two options:
-
-**Option A** — let `bin/team` open a fresh iTerm window for you:
-
-```sh
-./bin/team
-```
-
-**Option B** — use any iTerm window you already have open. Just run
-`claude` in one pane and `codex` in another. teammate-mcp finds them
-by process name; no labels needed.
-
-### 4. (One-time) Hand the agents the operating rules
-
-Drop `templates/AGENTS.md` into your project root. Both Claude Code
-and Codex will pick it up automatically (it's the convention they
-both follow). The file tells them how and when to call each other.
-
-### 5. (Optional) Add per-pane labels for N:M setups
-
-For more than one agent of either type, label each pane *before*
-launching its CLI:
-
-```sh
-# pane 1
-export TEAMMATE_LABEL=plan
-claude
-
-# pane 2
-export TEAMMATE_LABEL=worker
-codex
-
-# pane 3
-export TEAMMATE_LABEL=tester
-codex --yolo
-```
-
-The MCP server auto-registers each pane to its label on startup.
-Then from any pane:
-
-```
-ask("worker",  "implement foo()")
-ask("tester",  "write tests for foo()")
-ask("plan",    "review this design")    # from worker, asking back
-```
-
-You can also address a pane by the iTerm session name (`cmd+I`) or by
-any prefix of its UUID — `ask("Worker A", …)` or `ask("7B5B0D11", …)`.
-
-### 6. (Optional) Show the label in your status bar
-
-```sh
-./bin/install-statusline
-```
-
-Adds a `statusLine` block to `~/.claude/settings.json` and a precmd
-hook to `~/.zshrc` that updates the iTerm tab title from
-`$TEAMMATE_LABEL`. Both Claude (native statusLine) and Codex (tab
-title) show the label visibly. Idempotent; backs up your existing
-settings.
-
-### 7. Try it
-
-In the Claude pane:
-
-```
-Ask the worker pane what timezone library it prefers in Python.
-```
-
-You'll see Claude call `ask`, the question appear in the *worker*
-pane, Codex respond there, and Claude relay the answer.
-
----
-
-## Slash commands (Claude Code)
-
-Two slash commands ship with the repo, in `commands/`. Drop them into
-`~/.claude/commands/` (or `<project>/.claude/commands/`) to use them.
-
-### `/ask <label> <question…>` — fast path
-
-Routes the question to the target pane via the **CLI directly**,
-bypassing the MCP tool. Use this when you already know the label.
-
-```
-/ask claude20 위 코드의 시간복잡도가 어떻게 돼?
-/ask worker  pytest를 실행해줘
-/ask codex1  Python에서 timezone-aware datetime 만드는 가장 좋은 방법?
-```
-
-Why this exists: the MCP tool path (`mcp__teammate__ask`) is correct
-but slow when invoked from Claude Code — Anthropic defers MCP tool
-schemas to a `ToolSearch` lookup (1–3 s extra) and Opus extended
-thinking adds another 10–40 s deciding to route. `/ask` collapses
-that to a single deterministic Bash call.
-
-Empirical comparison on the same physical pane (claude20 → "ack"):
-
-| Path                                 | Round trip |
-|--------------------------------------|------------|
-| Natural language → `mcp__teammate__ask` | 30–80 s   |
-| `/ask claude20 …`                    | 3–6 s     |
-| Plain CLI in shell                   | 2–4 s     |
-
-### `/team-ask <label> <question…>` — MCP path
-
-The original. Goes through `mcp__teammate__ask`. Use when you want
-the tool-call to be visible in the transcript, or when the `ask`
-needs to be part of a larger LLM-mediated workflow.
-
-### Other slash commands
-
-- `/team-register` — alias for `tmclaude` / `tmcodex`. Registers the
-  current pane in the registry.
-- `/team-list` — print all registered panes.
-
-## Natural-language routing
-
-You can also just say it:
-
-```
-claude20에게 안녕이라고 물어봐
-codex1한테 README 검토해달라고 해
-worker에게 빌드 다시 돌려달라고 시켜
-```
-
-The bundled `templates/CLAUDE.md` (drop into `~/.claude/CLAUDE.md`)
-tells Claude to prefer the **Bash CLI** for asks where the user
-already gave an explicit label, and to fall back to
-`mcp__teammate__ask` only when the target is ambiguous (and a
-`list_panes` call is needed first). This keeps natural-language asks
-fast without sacrificing the MCP path's flexibility.
-
----
-
-## How it works
-
-```
-┌──────────────────────────────────────────────────────┐
-│  Claude pane              Codex pane                  │
-│  ─────────────            ─────────────               │
-│   user prompt              [teammate-mcp ASK …]       │
-│        │ tool call              ▲                     │
-│        ▼                        │ async_send_text     │
-│  ┌──────────────┐               │                     │
-│  │ teammate-mcp │  ─────────────┘                     │
-│  │  (FastMCP)   │  ◄────── async_get_screen_contents  │
-│  └──────────────┘                                     │
-│        │                                              │
-│        └─► returns extracted answer to Claude         │
-└──────────────────────────────────────────────────────┘
-```
-
-For each `ask_codex` (or `ask_claude`) call:
-
-1. Generate a unique marker, enqueue the message in the on-disk queue
-   (`pending/` → `inflight/` atomic rename).
-2. Locate the target pane:
-   - prefer ``TEAMMATE_<UPPER>_SESSION_ID`` env override
-   - otherwise enumerate all live processes (`ps`-style), find any
-     `claude` or `codex` process, read its `TERM_SESSION_ID` env var,
-     and match that against iTerm's session list. **This works through
-     `tmux`, login shells, and pyenv wrappers** — anywhere the
-     environment variable is inherited.
-   - fall back to `jobName` / `commandLine` matching with cwd
-     preference.
-3. `async_send_text` the prompt + a request to terminate the reply
-   with the marker.
-4. Poll `async_get_screen_contents` for the marker. Because the prompt
-   we typed contains the marker text (it gets echoed in the pane), the
-   server requires the marker to appear **twice** before treating the
-   reply as complete.
-5. Slice the answer between the two marker occurrences, log
-   `ask.complete`, return the answer to the caller.
-
-### What "no config" actually means
-
-There is exactly one thing to configure (once): the MCP registration
-in step 2 above. After that, any iTerm window with claude+codex panes
-just works — including windows that were already open before you
-installed teammate-mcp.
-
-You never write a `.teammate.toml`, you never `teammate start`, you
-never have to remember which session id is which.
-
-## Testing
-
-```sh
-uv pip install -e ".[dev]"
-pytest                              # 18 unit + integration tests
-python scripts/auto_demo.py         # full end-to-end demo (spawns iTerm)
-```
-
-The unit tests cover the queue, ANSI/marker handling, server module
-import, and the iTerm session-discovery logic with mocks. The
-end-to-end demo opens a real iTerm window and exercises a Claude →
-Codex → Claude round trip; it requires both CLIs to be logged in and
-will incur their normal API charges.
-
-Per-run timing reports are written to `tests/results/*.jsonl`. The
-ones already committed to the repo are real, not synthetic.
-
-## Troubleshooting
-
-**"iTerm Python API is not enabled"** — Settings → General → Magic →
-"Enable Python API" ✓. The first time `teammate-mcp` connects, iTerm
-also prompts for permission; click *Allow*.
-
-**"asyncio.run() cannot be called from a running event loop"** — you're
-on a teammate-mcp older than 0.1.0. Pull `main`; the tools are now
-declared `async`.
-
-**"Tool returned an answer that's just my own prompt echo"** — the
-prompt-target pane is running the wrong CLI (e.g., the lookup picked a
-sibling pane that had the same process running). Pin the pane
-explicitly:
-
-```sh
-export TEAMMATE_CLAUDE_SESSION_ID=<unique id from iTerm>
-export TEAMMATE_CODEX_SESSION_ID=<unique id from iTerm>
-```
-
-(You can read each pane's `unique id` from
-`Window menu → Window Settings → Identifier`, or via AppleScript.)
-
-**"Marker not detected within timeout"** — the agent on the other end
-forgot to emit `<<DONE_…>>`. Add an explicit reminder in your
-`AGENTS.md`. The bundled template already includes this.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-## Acknowledgments
-
-This project crystallised from conversations on top of public research
-into how Claude Code and Codex are being run in 2026:
-
-- Anthropic's *Plan-Generate-Verify* and *Initializer + Coding Agent*
-  harness papers (Rajasekaran 2026-03; Justin Young 2025-11).
-- IndyDevDan's [`claude-code-hooks-mastery`](https://github.com/disler/claude-code-hooks-mastery)
-  for the observability patterns.
-- OthmanAdi's [`planning-with-files`](https://github.com/OthmanAdi/planning-with-files)
-  for the "structured files bridge sessions, not chat history" idea.
-- Boris Cherny's "verification loop" rule from his
-  *How I use Claude Code* thread.
-- Geoffrey Huntley's [Ralph Wiggum](https://ghuntley.com/ralph/)
-  loop for the "fresh context per turn" intuition.
-
-The implementation owes its iTerm Python API patterns to the iTerm2
-docs at <https://iterm2.com/python-api/>.
-
----
-
-## 한국어 요약
-
-CCB 같은 사전 설정 없이 **claude / codex가 서로에게 질문**할 수 있게
-해주는 작은 MCP 서버입니다.
-
-- iTerm 두 페인에 그냥 `claude`와 `codex`를 띄우기만 하면 됩니다.
-  라벨도, config도, daemon도 없습니다.
-- iTerm Python API로 상대 페인을 자동 탐지(실행 프로세스 + 환경변수
-  `TERM_SESSION_ID` 매칭)합니다 — `tmux` 안에서 띄워도 작동합니다.
-- 메시지는 push, 응답은 polling으로 받고, 모든 round trip은
-  `~/.teammate-mcp/logs/<날짜>.jsonl`에 기록됩니다.
-- 실측 round-trip 시간: **2 + 2 = 4 질문 기준 send → complete 3.0초**
-  (대부분 Codex thinking 시간).
-
-설치는 위 영문 Quick start 1~3단계, 사용법은 그냥 평소처럼 Claude에게
-"Codex에게 물어봐"라고 시키면 됩니다.
+The separate iTerm sanity test needs an interactive desktop. Live two-way,
+automatic active/idle delivery, word-chain and first-call registration evidence
+is in [reliable conversations](docs/reliable-conversations.md) and
+[automatic setup](docs/automatic-setup-plan.md).

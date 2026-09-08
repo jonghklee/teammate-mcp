@@ -43,8 +43,8 @@ def test_blocks_and_surfaces_pending_messages(hook):
     assert "evalworker2" in out["reason"]
     assert "ack 살아있음" in out["reason"]
     assert "claude3" in out["reason"]
-    # Tells the receiver how to reply (reverse async ask, not Bash).
-    assert "mcp__teammate__ask" in out["reason"]
+    # The reply references the received question, preserving correlation.
+    assert "mcp__teammate__reply(job_id='77'" in out["reason"]
 
 
 def test_block_reason_caps_attachments(hook):

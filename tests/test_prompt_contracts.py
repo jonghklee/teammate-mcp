@@ -51,6 +51,6 @@ def test_inbox_drain_hook_recommends_mcp_reply_only(tmp_path, monkeypatch, capsy
     assert hook.main() == 0
 
     out = capsys.readouterr().out
-    assert "mcp__teammate__ask(target='sender'" in out
+    assert "mcp__teammate__reply(job_id='job-1'" in out
     assert "teammate-mcp ask sender" not in out
     assert "via Bash" not in out

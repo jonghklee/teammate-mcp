@@ -1,30 +1,9 @@
-"""Watchdog daemon — wakes idle Claude Code panes when mail arrives.
+"""Recover pending pane messages without synthetic wake prompts.
 
-Run as: ``teammate-mcp watch [--interval 2.0]``
-
-Behavior loop (every ``interval`` seconds):
-
-  1. Prune dead registry entries.
-  2. For each label whose ``job`` is "Python" (i.e. a Claude Code
-     pane that almost certainly has the inbox-drain hook installed):
-       a. Check ``~/.teammate-mcp/mailbox/<label>/inbox/`` for new
-          (since-last-seen) message files.
-       b. If new mail and the pane's compose box looks empty, inject
-          ``/drain\\r`` to trigger a UserPromptSubmit and let the hook
-          drain the inbox.
-       c. If the compose box looks busy (user typing), skip — the
-          hook will fire whenever the user does submit, and the mail
-          will be drained then.
-  3. Logs every wake / skip to ``~/.teammate-mcp/logs/watchdog.log``
-     and (when ``TEAMMATE_LOG_VERBOSE=1``) to stderr.
-
-Compose-empty heuristic: capture the session's last screen lines via
-osascript and search for the pattern ``❯`` followed by only whitespace
-to the end of the line. False positives (rare cases the cell buffer
-hides typed content) just mean we sometimes skip when we shouldn't —
-strictly safer than waking on top of user input.
-
-Codex panes don't have a hook system, so we never wake them.
+Direct senders, this watchdog, and inbox hooks share a per-pane delivery lock.
+Active leases and ambiguous submissions are skipped. When a pending message
+can be delivered, its original envelope is submitted; no dot or drain command
+is inserted. Pane-free Codex threads use mailbox_worker instead.
 """
 
 from __future__ import annotations
@@ -48,16 +27,8 @@ PID_PATH = STATE_DIR / "watchdog.pid"
 HEARTBEAT_PATH = STATE_DIR / "watchdog-heartbeat.json"
 ENSURE_LOCK_PATH = STATE_DIR / "watchdog-ensure.lock"
 RUN_LOCK_PATH = STATE_DIR / "watchdog.lock"
-# Wake text: a one-word prompt that's safe to inject into an empty
-# compose box. We pick "." because:
-#   - it triggers UserPromptSubmit (so the hook drains the inbox)
-#   - the LLM sees both "." (user prompt) and the prepended inbox
-#     contents (hook stdout). Almost every LLM correctly ignores the
-#     dot and processes the inbox.
-#   - if Claude Code recognises a leading "/" as a slash command and
-#     rejects it ("Unknown command: /drain"), no submit happens and
-#     no hook fires — which defeats the wake. A bare word avoids that.
-WAKE_TEXT = "."
+# Heartbeat delivery protocol marker; no synthetic user prompt is sent.
+WAKE_TEXT = "message-envelope-v1"
 DEFAULT_INTERVAL = 2.0
 HEALTH_STALE_AFTER = 15.0
 
@@ -305,7 +276,7 @@ def _wake_action(screen: str, starving_waited: float, timeout: float) -> str:
       - ``"wake"``         idle at empty ❯ prompt → safe normal wake
       - ``"skip-typing"``  user has half-typed text → never inject
       - ``"wake-starved"`` Claude mid-turn and oldest msg waited
-                           ``>= timeout`` → force a wake (the "." queues)
+                           ``>= timeout`` → queue the actual pending envelope
       - ``"wait"``         Claude mid-turn but not yet starved → hold
     """
     if _screen_compose_is_empty(screen):
@@ -317,31 +288,52 @@ def _wake_action(screen: str, starving_waited: float, timeout: float) -> str:
     return "wait"
 
 
-def _wake(session_id: str) -> bool:
-    """Inject the wake text + Enter via osascript. Single CR sent
-    separately so it lands outside iTerm's bracket-paste envelope and
-    submits the slash command."""
-    body_script = (
-        'tell application "iTerm"\n'
-        '    repeat with w in windows\n'
-        '        repeat with t in tabs of w\n'
-        '            repeat with s in sessions of t\n'
-        f'                if (unique id of s) is "{session_id}" then\n'
-        f'                    tell s to write text "{WAKE_TEXT}" newline NO\n'
-        '                    delay 0.05\n'
-        '                    tell s to write text (ASCII character 13) newline NO\n'
-        '                end if\n'
-        '            end repeat\n'
-        '        end repeat\n'
-        '    end repeat\n'
-        'end tell'
-    )
-    try:
-        subprocess.run(["osascript", "-e", body_script],
-                       check=True, capture_output=True, text=True, timeout=10)
-        return True
-    except Exception as e:
-        _log(f"wake-failed sid={session_id[:8]} err={e!r}")
+def _wake(session_id: str, label: str) -> bool:
+    """Deliver one still-pending envelope under the same lock as direct send."""
+    from . import registry, server, iterm
+    from .pane_delivery import eligible_for_watch, legacy_input_enabled
+    if not legacy_input_enabled():
+        return False
+    with server._per_target_send_lock(label, max_wait=0) as acquired:
+        if not acquired:
+            return False
+        rec = registry.lookup(label)
+        if not rec or (rec.get("session_id") or "").upper() != session_id.upper():
+            return False
+        for path in sorted((MAILBOX / label / "inbox").glob("*.json")):
+            try:
+                message = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not eligible_for_watch(message):
+                continue
+            screen = iterm.osa_capture(session_id)
+            if _screen_user_is_typing(screen):
+                return False
+            # Re-read after the capture. Hooks also honor the shared send lock.
+            if not path.exists() or registry.lookup(label) != rec:
+                return False
+            message["delivery_lease"] = {"pid": os.getpid(), "expires_at": time.time() + 60}
+            message["pane_delivery"] = {"state": "dispatching", "via": "watchdog-message"}
+            server._write_inbox(label, message)
+            body = server._format_peer_message(message)
+            try:
+                iterm.osa_clear_and_inject(session_id, 0, body)
+                if server._body_stuck_in_compose(iterm.osa_capture(session_id), message["job_id"]):
+                    iterm.osa_send_raw(session_id, "\r")
+                    if server._body_stuck_in_compose(iterm.osa_capture(session_id), message["job_id"]):
+                        raise RuntimeError("message remains in compose")
+                server._move_to_processed(label, message["job_id"],
+                                          {"status": "delivered", "via": "watchdog-message"})
+                _log(f"delivered label={label} job={message['job_id']} via=message")
+                return True
+            except Exception as error:
+                if path.exists():
+                    message.pop("delivery_lease", None)
+                    message["pane_delivery"] = {"state": "uncertain", "via": "watchdog-message", "error": str(error)}
+                    server._write_inbox(label, message)
+                _log(f"delivery-failed label={label} job={message['job_id']} error={error!r}")
+                return False
         return False
 
 
@@ -404,8 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     # compose-empty gate would skip it forever and its inbox starves.
     # If the oldest pending message has waited this long AND the pane is
     # "working" (no ❯ prompt) rather than "user typing" (❯ + text), we
-    # force-wake: the injected "." just queues and fires the drain hook
-    # once the current turn ends.
+    # queue the pending message itself once the current turn ends.
     STARVATION_TIMEOUT = 90.0  # seconds
     starving_since: dict[str, float] = {}
     _log(f"watchdog start interval={args.interval}s self_sid={self_sid[:8] or '(unknown)'}")
@@ -431,8 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             # while the shell is still zsh, then exec claude replaces
             # the shell but the registry keeps "zsh"). Wake all alive
             # panes; if a pane has no hook (codex / plain shell), the
-            # injected "." just becomes a harmless prompt that the
-            # underlying TUI either echoes or ignores. Compose-empty
+            # pending envelope is delivered directly to the underlying TUI. Compose-empty
             # detection still gates against busy panes.
             inbox = MAILBOX / label / "inbox"
             if not inbox.exists():
@@ -440,13 +430,19 @@ def main(argv: list[str] | None = None) -> int:
             files = list(inbox.glob("*.json"))
             if not files:
                 continue
-            newest_mtime = max(f.stat().st_mtime for f in files)
+            from .pane_delivery import eligible_for_watch
+            eligible = []
+            for path in files:
+                try:
+                    if eligible_for_watch(json.loads(path.read_text())):
+                        eligible.append(path)
+                except (OSError, ValueError):
+                    continue
+            if not eligible:
+                continue
+            files = eligible
             now = time.time()
             since_last = now - last_wake.get(label, 0.0)
-            if newest_mtime <= last_wake.get(label, 0.0):
-                # No file newer than the last wake — already in
-                # someone's processing pipeline.
-                continue
             if since_last < COOLDOWN:
                 # Cooldown — give the receiver time to finish its LLM
                 # turn before we poke it again.
@@ -471,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
                 _log(f"skip-busy(working {now - first:.0f}/{STARVATION_TIMEOUT:.0f}s) "
                      f"label={label} ({len(files)} pending msg)")
             else:  # "wake" or "wake-starved"
-                if _wake(sid):
+                if _wake(sid, label):
                     tag = "woke" if action == "wake" else f"woke(starvation {waited:.0f}s)"
                     _log(f"{tag} label={label} for {len(files)} pending msg")
                     woken += 1

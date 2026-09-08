@@ -33,22 +33,25 @@ def _exclusive_lock():
     """
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    acquired = False
     try:
         deadline = time.monotonic() + 10.0
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
                 break
             except OSError as e:
                 if e.errno not in (errno.EAGAIN, errno.EACCES):
                     raise
                 if time.monotonic() >= deadline:
-                    break
+                    raise TimeoutError("registry lock timed out") from e
                 time.sleep(0.05)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
 
@@ -116,6 +119,15 @@ def register(
     """
     with _exclusive_lock():
         data = load()
+        if data.get(label, {}).get("transport") == "mailbox":
+            raise ValueError(f"label {label!r} belongs to a mailbox session")
+        previous = data.get(label, {})
+        if previous.get("transport") == "claude-channel" or previous.get("channel"):
+            same_pane = bool(session_id and previous.get("session_id") == session_id)
+            same_owner = bool((extra or {}).get("claude_owner") and
+                              previous.get("claude_owner") == extra["claude_owner"])
+            if not same_pane and not same_owner:
+                raise ValueError(f"label {label!r} belongs to another channel session")
         if dedupe_session_id and session_id:
             target_sid = session_id.upper()
             collisions = [
@@ -124,7 +136,10 @@ def register(
             ]
             for l in collisions:
                 data.pop(l, None)
+        previous = data.get(label, {})
+        same_pane = bool(session_id and (previous.get("session_id") or "").upper() == session_id.upper())
         data[label] = {
+            **(previous if same_pane else {}),
             "label": label,
             "session_id": session_id,
             "pid": pid,
@@ -139,7 +154,36 @@ def register(
 def unregister(label: str) -> None:
     with _exclusive_lock():
         data = load()
+        if data.get(label, {}).get("transport") in ("mailbox", "claude-channel") or data.get(label, {}).get("channel"):
+            from .server import MAILBOX_ROOT
+            import uuid
+            mailbox = MAILBOX_ROOT / label
+            if mailbox.exists():
+                # Fail loudly if archival fails; don't release an address
+                # whose previous owner's mail is still reachable.
+                mailbox.rename(MAILBOX_ROOT / f".archived-{label}-{uuid.uuid4().hex}")
         data.pop(label, None)
+        _save_raw(data)
+
+
+def register_mailbox(label: str, thread_id: str, cwd: str) -> None:
+    """Claim a pane-free address without replacing another session's label."""
+    with _exclusive_lock():
+        data = load()
+        for other_label, rec in data.items():
+            if (other_label != label and rec.get("transport") == "mailbox"
+                    and rec.get("thread_id") == thread_id):
+                raise ValueError(f"thread already registered as {other_label!r}")
+        existing = data.get(label)
+        if existing and (existing.get("transport") != "mailbox"
+                         or existing.get("thread_id") != thread_id):
+            raise ValueError(f"label {label!r} belongs to another session")
+        data[label] = {
+            **(existing or {}),
+            "label": label, "session_id": "", "transport": "mailbox",
+            "thread_id": thread_id, "job": "codex", "cwd": cwd,
+            "registered_at": time.time(),
+        }
         _save_raw(data)
 
 

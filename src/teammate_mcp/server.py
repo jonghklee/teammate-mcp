@@ -29,6 +29,7 @@ from typing import List, Optional
 
 import iterm2
 from mcp.server.fastmcp import FastMCP
+from .session_identity import current_thread_id, request_thread_id, request_identity
 
 from .iterm import (
     SessionRef,
@@ -52,9 +53,27 @@ from .queue import MessageQueue
 from . import registry
 
 
+def _safe_getcwd() -> str:
+    """Best-effort working directory that never aborts module import.
+
+    os.getcwd() raises ``PermissionError: [Errno 1] Operation not permitted``
+    under the macOS sandbox when the process's working directory isn't
+    readable — e.g. a Claude Code Stop hook fired from a restricted dir.
+    Because this module is imported by *every* ``teammate-mcp`` subcommand
+    (cli.py imports server.py at load time), an unguarded getcwd() here
+    crashed harmless commands like ``claude-notify`` on import. PROJECT_CWD is
+    only a hint for pane disambiguation + the start-up log line, so degrade
+    gracefully instead of crashing. Set TEAMMATE_CWD to skip getcwd entirely.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return os.environ.get("PWD") or str(Path.home())
+
+
 # Configurable through env so users can flip audit mode without code edits.
 QUEUE_MODE = os.environ.get("TEAMMATE_QUEUE_MODE", "ephemeral")
-PROJECT_CWD = os.environ.get("TEAMMATE_CWD") or os.getcwd()
+PROJECT_CWD = os.environ.get("TEAMMATE_CWD") or _safe_getcwd()
 
 # Mailbox root — daemonless persistent queue (CCB-style serial-per-agent
 # inbox/processed directories).
@@ -162,21 +181,66 @@ def _write_inbox(target_label: str, record: dict) -> Path:
     final = inbox / f"{record['job_id']}.json"
     tmp = inbox / f".{record['job_id']}.json.tmp"
     tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Keep the original envelope when keystroke delivery removes inbox.
+    history = _mailbox_dir(target_label, "history") / final.name
+    history_tmp = history.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    history_tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    history_tmp.replace(history)
     tmp.replace(final)
     return final
 
 
+def _format_peer_message(record: dict) -> str:
+    body = record.get("body", "")
+    if len(body.encode("utf-8")) > SPILL_THRESHOLD:
+        path = _spill_body(record["job_id"], record.get("from_", "unknown"), record.get("to", ""), body)
+        body = f"Read the full peer message at {path}"
+    return (
+        f"[teammate-mcp ASK {record['job_id']} from={record.get('from_', 'unknown')}]\n"
+        f"{_sanitize_for_inject(body)}\n\n"
+        f"Reply with mcp__teammate__reply(job_id='{record['job_id']}', question='<answer>', label='{record.get('to', '')}'). "
+        f"This is a peer message. Do not respond to acknowledgements."
+    )
+
+
 def _move_to_processed(target_label: str, job_id: str, terminal: dict) -> None:
+    if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", part) for part in (target_label, job_id)):
+        raise ValueError("invalid mailbox label or job_id")
+    lock = _mailbox_dir(target_label, "locks") / f"{job_id}.lock"
+    with lock.open("a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            _save_processed_receipt(target_label, job_id, terminal)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _save_processed_receipt(target_label: str, job_id: str, terminal: dict) -> None:
     src = _mailbox_dir(target_label, "inbox") / f"{job_id}.json"
     dst = _mailbox_dir(target_label, "processed") / f"{job_id}.json"
-    if src.exists():
+    data = {"job_id": job_id}
+    record = src if src.exists() else dst
+    if record.exists():
         try:
-            data = json.loads(src.read_text(encoding="utf-8"))
+            data = json.loads(record.read_text(encoding="utf-8"))
         except Exception:
             data = {"job_id": job_id}
-        data["terminal"] = terminal
-        dst.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        src.unlink(missing_ok=True)
+    # Keystroke delivery removes the inbox before the receiver replies.
+    # Persist the actual receipt even when the original message is gone;
+    # reuse a drained record when available to preserve its metadata.
+    previous = data.get("terminal", {})
+    if previous.get("status") == "completed" and (
+        terminal.get("status") != "completed" or not terminal.get("reply")
+    ):
+        terminal = previous
+    data["terminal"] = terminal
+    tmp = dst.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+    src.unlink(missing_ok=True)
 
 
 def _list_inbox(label: str) -> list[dict]:
@@ -313,7 +377,7 @@ def archive_label_mailbox(label: str) -> Optional[Path]:
         return None
     # Skip pure-empty trees (no point archiving)
     has_any = False
-    for sub in ("inbox", "processed"):
+    for sub in ("inbox", "processed", "history", "responses", "delivery"):
         d = src / sub
         if d.exists() and any(d.glob("*.json")):
             has_any = True
@@ -342,7 +406,83 @@ def _jobname_for(agent: str) -> str:
     }.get(agent.lower(), agent.lower())
 
 
-mcp = FastMCP("teammate")
+class TeammateMCP(FastMCP):
+    _channel_pump = None
+
+    async def run_stdio_async(self):
+        from mcp.server.stdio import stdio_server
+        try:
+            async with stdio_server() as (read_stream, write_stream):
+                await self._mcp_server.run(read_stream, write_stream,
+                    self._mcp_server.create_initialization_options(
+                        experimental_capabilities={"claude/channel": {}}))
+        finally:
+            if self._channel_pump:
+                if self._channel_pump.task:
+                    self._channel_pump.task.cancel()
+                    await asyncio.gather(self._channel_pump.task, return_exceptions=True)
+                await self._channel_pump.close()
+
+    async def _ensure_channel(self):
+        if self._channel_pump:
+            return
+        try:
+            session = self.get_context().request_context.session
+            client = session.client_params.clientInfo.name.lower()
+        except (LookupError, ValueError, AttributeError):
+            return
+        if "claude" not in client:
+            return
+        label = _caller_label()
+        if not label:
+            import hashlib
+            import psutil
+            parent = psutil.Process(os.getppid())
+            owner = f"{parent.pid}:{parent.create_time()}"
+            label = "claude-channel-" + hashlib.sha256(owner.encode()).hexdigest()[:12]
+            existing = registry.lookup(label)
+            if existing and existing.get("claude_owner") != owner:
+                raise ValueError("channel address belongs to another process")
+            registry.register(label, "", parent.pid, "claude", os.getcwd(),
+                              extra={"transport": "claude-channel", "claude_owner": owner})
+            os.environ["TEAMMATE_LABEL"] = label
+        from .claude_channel import ChannelPump
+        self._channel_pump = ChannelPump(label, session)
+        async def start_channel():
+            # Let tools/list finish before the client starts handling events.
+            await asyncio.sleep(0.5)
+            await self._channel_pump.connect()
+            await self._channel_pump.run()
+        self._channel_pump.task = asyncio.create_task(start_channel())
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        await self._ensure_channel()
+        return tools
+
+    async def call_tool(self, name, arguments):
+        try:
+            meta = self.get_context().request_context.meta
+        except (LookupError, ValueError):
+            meta = None
+        with request_identity(meta):
+            await self._ensure_channel()
+            if name in ("register_mailbox", "register_self"):
+                result = await super().call_tool(name, arguments)
+                await _bootstrap_caller()
+                return result
+            await _bootstrap_caller()
+            return await super().call_tool(name, arguments)
+
+
+mcp = TeammateMCP("teammate", instructions=(
+    "Sessions register automatically when identifiable. Use connection_status to see your address. "
+    "Use ask for questions and reply(job_id, question) for correlated answers. "
+    "Sent/queued is not a completed answer. Never acknowledge an acknowledgement. "
+    "When an actual <channel> handshake arrives, call channel_ready with its nonce. "
+    "Channel events enter the execution queue without changing the draft input. "
+    "Never simulate readiness without receiving a handshake event."
+))
 _log = get_logger()
 
 # Per-target-pane lock. Only one ask at a time per session — concurrent
@@ -351,6 +491,7 @@ _log = get_logger()
 # The lock serialises sends; a second ask waits for the first to fully
 # complete before it injects text.
 _pane_locks: dict[str, asyncio.Lock] = {}
+_startup_pane: Optional[dict] = None
 
 
 def _pane_lock(session_id: str) -> asyncio.Lock:
@@ -429,6 +570,90 @@ def _ensure_watchdog_running_best_effort() -> None:
         pass
 
 
+def _caller_mailbox_label() -> str:
+    thread_id = current_thread_id()
+    if not thread_id:
+        return ""
+    matches = [label for label, rec in registry.all_labels().items()
+               if rec.get("transport") == "mailbox" and rec.get("thread_id") == thread_id]
+    return matches[0] if len(matches) == 1 else ""
+
+
+def _caller_label() -> str:
+    if request_thread_id():
+        matches = [label for label, rec in registry.all_labels().items()
+                   if rec.get("thread_id") == request_thread_id()]
+        if len(matches) == 1:
+            return matches[0]
+        return _caller_mailbox_label()
+    explicit = os.environ.get("TEAMMATE_LABEL", "").strip()
+    if explicit:
+        return explicit
+    tsid = os.environ.get("TERM_SESSION_ID", "").split(":")[-1].upper()
+    if tsid:
+        for label, rec in registry.all_labels().items():
+            sid = (rec.get("session_id") or "").upper()
+            if sid and (sid == tsid or sid.endswith(tsid)):
+                return label
+    return _caller_mailbox_label()
+
+
+async def _bootstrap_caller():
+    thread_id = current_thread_id()
+    if not thread_id:
+        return
+    # Request metadata wins even when a shared process inherited a pane label.
+    if not request_thread_id() and os.environ.get("TERM_SESSION_ID"):
+        return
+    existing = _caller_mailbox_label()
+    if not existing and _startup_pane:
+        # A standalone CLI may emit thread metadata without exposing that
+        # thread on the desktop app-server. Preserve its verified real pane.
+        pane = registry.lookup(_startup_pane["label"])
+        if pane and pane.get("session_id") == _startup_pane["session_id"]:
+            if pane.get("thread_id") == thread_id:
+                return
+            if not pane.get("thread_id"):
+                from .codex_transport import AppServer, default_socket
+                direct = False
+                try:
+                    async with AppServer(default_socket()) as rpc:
+                        thread = (await rpc.request("thread/read", {"threadId": thread_id, "includeTurns": False}))["thread"]
+                        direct = thread.get("id") == thread_id and thread.get("canAcceptDirectInput")
+                except (OSError, RuntimeError, TimeoutError):
+                    pass
+                if not direct:
+                    with registry._exclusive_lock():
+                        data = registry.load()
+                        current = data.get(_startup_pane["label"], {})
+                        if current.get("thread_id") == thread_id and current.get("session_id") == pane.get("session_id"):
+                            return
+                        if data.get(_startup_pane["label"]) == pane:
+                            data[_startup_pane["label"]]["thread_id"] = thread_id
+                            registry._save_raw(data)
+                            return
+    if not existing:
+        result = await register_mailbox(thread_id=thread_id)
+        if result.startswith("ERROR:"):
+            raise ValueError(result)
+        existing = _caller_mailbox_label()
+    record = registry.lookup(existing)
+    if record.get("auto_delivery"):
+        from .mailbox_worker import ensure_worker
+        ensure_worker()
+    if "auto_delivery" not in record:
+        result = await configure_mailbox_delivery(existing)
+        if result.get("error"):
+            _log.event("bootstrap.delivery_unavailable", label=existing, error=result["error"])
+            with registry._exclusive_lock():
+                data = registry.load()
+                if data.get(existing, {}).get("thread_id") == thread_id:
+                    if "auto_delivery" in data[existing]:
+                        return
+                    data[existing]["setup_error"] = result["error"]
+                    registry._save_raw(data)
+
+
 async def _ask_async(
     question: str,
     target: str = "",
@@ -437,6 +662,8 @@ async def _ask_async(
     safe_max_wait: float = 30.0,
     wait: bool = False,
     mailbox_only: Optional[bool] = None,
+    in_reply_to: str = "",
+    conversation_id: str = "",
 ) -> str:
     """Drive one ask: enqueue → push (osascript) → return immediately.
 
@@ -467,24 +694,64 @@ async def _ask_async(
     #      bash tool) inherits TERM_SESSION_ID from the iTerm shell
     #   3. fallback_agent — set when caller used ask_codex/ask_claude
     #   4. "unknown" — last resort
-    from_agent = os.environ.get("TEAMMATE_LABEL", "").strip()
+    from_agent = _caller_label()
     if not from_agent:
-        tsid = os.environ.get("TERM_SESSION_ID", "")
-        sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
-        if sid_tail:
-            for label, rec in registry.all_labels().items():
-                rec_sid = (rec.get("session_id") or "").upper()
-                if rec_sid == sid_tail or rec_sid.endswith(sid_tail) or sid_tail.endswith(rec_sid):
-                    from_agent = label
-                    break
-    if not from_agent:
-        from_agent = fallback_agent or "unknown"
+        return "ERROR: caller identity unavailable; reconnect MCP or register the actual session"
     msg = _queue.enqueue(from_agent, addressee, question, timeout=timeout)
+    envelope = {"conversation_id": conversation_id or msg.id,
+                "in_reply_to": in_reply_to or None,
+                "message_kind": "reply" if in_reply_to else "question"}
     _log.event(
         "ask.enqueue",
         id=msg.id, from_=from_agent, to=addressee,
         target_spec=target or None, len=len(question),
     )
+
+    # Explicit pane-free endpoints are durable inboxes. They do not have
+    # an iTerm ID and must never be routed through pane liveness/injection.
+    endpoint = registry.lookup(target) if target else None
+    if endpoint and endpoint.get("transport") == "mailbox":
+        try:
+            with registry._exclusive_lock():
+                if registry.lookup(target) != endpoint:
+                    raise ValueError("recipient registration changed; resolve the recipient again")
+                _write_inbox(target, {
+                    **envelope,
+                    "job_id": msg.id, "from_": from_agent, "to": target,
+                    "body": question, "created_at": _now_iso(), "status": "queued",
+                    "recipient_thread_id": endpoint.get("thread_id"),
+                })
+        except Exception as e:
+            _queue.fail(msg.id, str(e))
+            return f"ERROR: mailbox delivery failed: {e}"
+        _queue.complete(msg.id, "")
+        if endpoint.get("auto_delivery"):
+            from .mailbox_worker import ensure_worker
+            ensure_worker()
+        return f"queued mailbox message: job_id={msg.id} to {target}"
+
+    from .pane_delivery import legacy_input_enabled
+    if not legacy_input_enabled():
+        if not endpoint:
+            _queue.fail(msg.id, "registered native target required")
+            return "ERROR: an explicit registered native target label is required"
+        from .claude_channel import channel_ready as is_channel_ready
+        try:
+            with registry._exclusive_lock():
+                current = registry.lookup(target)
+                if not current or any(current.get(key) != endpoint.get(key) for key in
+                                      ("session_id", "thread_id", "claude_owner", "transport")):
+                    raise ValueError("recipient registration changed")
+                _write_inbox(target, {**envelope, "job_id": msg.id, "from_": from_agent,
+                    "to": target, "body": question, "created_at": _now_iso(), "status": "queued",
+                    "delivery_mode": "claude-channel", "recipient_session_id": endpoint.get("session_id"),
+                    "recipient_claude_owner": endpoint.get("claude_owner")})
+        except Exception as error:
+            _queue.fail(msg.id, str(error))
+            return f"ERROR: channel queue write failed: {error}"
+        _queue.complete(msg.id, "")
+        state = "ready" if is_channel_ready(endpoint) else "awaiting-channel-handshake"
+        return f"queued channel message: job_id={msg.id} to {target} ({state})"
 
     sid = _resolve_target_session_id(target, fallback_agent)
     _log.event("ask.resolve", id=msg.id, found=sid is not None, session_id=sid)
@@ -515,6 +782,9 @@ async def _ask_async(
     # message is never lost — even if injection is refused due to a
     # danger prompt, the target can pick it up via /inbox or a hook.
     inbox_record = {
+        **envelope,
+        "delivery_mode": "mailbox" if mailbox_only else "injecting",
+        **({} if mailbox_only else {"delivery_lease": {"pid": os.getpid(), "expires_at": time.time() + 120}}),
         "job_id": msg.id,
         "from_": from_agent,
         "to": addressee,
@@ -526,6 +796,8 @@ async def _ask_async(
         _write_inbox(addressee, inbox_record)
     except Exception as e:
         _log.event("ask.inbox_write_failed", id=msg.id, error=repr(e))
+        _queue.fail(msg.id, str(e))
+        return f"ERROR: durable message write failed: {e}"
 
     if mailbox_only:
         _log.event("ask.mailbox_only", id=msg.id, to=addressee)
@@ -533,37 +805,7 @@ async def _ask_async(
         _queue.complete(msg.id, "")
         return f"queued mailbox-only message for {addressee}"
 
-    marker = f"tmdone-{msg.id}-end"
-    # Spill huge bodies to disk and inject only a short reference.
-    # Threshold gates by *byte* count, not chars, since multibyte
-    # Korean inflates fast.
-    use_spool = len(question.encode("utf-8")) > SPILL_THRESHOLD
-    if use_spool:
-        spool_path = _spill_body(msg.id, from_agent, addressee, question)
-        body_kernel = (
-            f"본문이 길어서 파일로 저장됐어. 이 파일을 읽어 처리해줘:\n"
-            f"  {spool_path}\n\n"
-            f"(파일 내용 = 본인의 user prompt 라고 생각하면 됨. "
-            f"처리 후 파일 그대로 두거나 unlink 가능.)"
-        )
-        _log.event("ask.spilled", id=msg.id, path=str(spool_path),
-                   bytes=len(question.encode("utf-8")))
-    else:
-        body_kernel = question
-
-    # Fix C: sanitize the body so a stray ESC/BEL in the user's question
-    # can't wedge the receiver TUI in a corrupt parser state (e.g. phantom
-    # paste-mode where every keystroke disappears).
-    body_kernel = _sanitize_for_inject(body_kernel)
-
-    body = (
-        f"[teammate-mcp ASK {msg.id} from={from_agent}]\n"
-        f"{body_kernel}\n\n"
-        f"Reply when you can by calling: "
-        f"`mcp__teammate__ask(target='{from_agent}', question='<your reply>')`\n"
-        f"Do not use Bash or write XML/tool tags for teammate replies.\n"
-        f"(no marker required; the sender is not blocked).\n"
-    )
+    body = _format_peer_message(inbox_record)
 
     _queue.claim(msg.id)
     _log.event("ask.send_start", id=msg.id, to=addressee, session_id=sid, wait=wait)
@@ -588,8 +830,18 @@ async def _ask_async(
         Returns (saved, delivered)."""
         with _per_target_send_lock(addressee) as got_lock:
             if not got_lock:
-                _log.event("ask.lock_timeout_proceeding", id=msg.id,
+                _log.event("ask.lock_timeout_queued", id=msg.id,
                            target=addressee)
+                return "", False
+            source = MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json"
+            if not source.exists():
+                _log.event("ask.already_handled", id=msg.id)
+                return "", True
+            latest = json.loads(source.read_text())
+            if latest.get("delivery_mode") == "claude-channel":
+                return "", False
+            inbox_record["delivery_lease"] = {"pid": os.getpid(), "expires_at": time.time() + 120}
+            _write_inbox(addressee, inbox_record)
 
             # (Fix D — picker detection — removed)
             # 사용자 결정 (2026-05-14): picker UI 자체를 환경에서 강제 차단
@@ -662,6 +914,8 @@ async def _ask_async(
             try:
                 # Single osascript: DEL × clear_count + body + Enter.
                 # Saves ~400-600 ms vs. doing them as separate calls.
+                inbox_record["pane_delivery"] = {"state": "dispatching", "via": "direct"}
+                _write_inbox(addressee, inbox_record)
                 osa_clear_and_inject(sid, clear_count, body)
                 _log.event("ask.send", id=msg.id, to=addressee,
                            session_id=sid, mode="legacy-keystroke",
@@ -669,6 +923,7 @@ async def _ask_async(
             except Exception as e:
                 _log.event("ask.send_failed_falling_back_to_file",
                            id=msg.id, error=repr(e))
+                inbox_record["pane_delivery"] = {"state": "uncertain", "via": "direct", "error": str(e)}
                 return local_saved, False
 
             # The inject's Enter fires the receiver's UserPromptSubmit hook
@@ -771,6 +1026,10 @@ async def _ask_async(
         _log.event("ask.send_failed_falling_back_to_file",
                    id=msg.id, error=repr(e))
 
+    source = MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json"
+    if source.exists() and json.loads(source.read_text()).get("delivery_mode") == "claude-channel":
+        _queue.complete(msg.id, "")
+        return f"queued channel message: job_id={msg.id} to {addressee}"
     if delivered_via_keystroke:
         try:
             (MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json").unlink(
@@ -778,6 +1037,12 @@ async def _ask_async(
             )
         except Exception:
             pass
+    else:
+        source = MAILBOX_ROOT / addressee / "inbox" / f"{msg.id}.json"
+        if source.exists():
+            inbox_record.pop("delivery_lease", None)
+            inbox_record["delivery_mode"] = "mailbox"
+            _write_inbox(addressee, inbox_record)
 
     # Always async path: kick watchdog so the receiver's hook fires soon,
     # then return immediately. Receiver replies via reverse async ask.
@@ -850,20 +1115,9 @@ async def inbox(label: str = "") -> list[dict]:
     idle — process each entry and reply via ``ask(target=<from_>,
     question=<reply>)``.
     """
-    label = label.strip()
+    label = label.strip() or _caller_label()
     if not label:
-        # Resolve caller label
-        label = os.environ.get("TEAMMATE_LABEL", "").strip()
-        if not label:
-            tsid = os.environ.get("TERM_SESSION_ID", "")
-            sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
-            for lbl, rec in registry.all_labels().items():
-                rec_sid = (rec.get("session_id") or "").upper()
-                if rec_sid == sid_tail or (sid_tail and rec_sid.endswith(sid_tail)):
-                    label = lbl
-                    break
-        if not label:
-            return [{"error": "no caller label resolvable"}]
+        return [{"error": "no caller label resolvable"}]
     return _list_inbox(label)
 
 
@@ -1045,7 +1299,7 @@ async def mark_processed(job_id: str, target: str = "", reply: str = "") -> str:
     waiting via ``watch`` can read it.
     """
     if not target:
-        target = os.environ.get("TEAMMATE_LABEL", "").strip()
+        target = _caller_label()
     if not target:
         return "ERROR: no target label"
     try:
@@ -1086,12 +1340,206 @@ async def list_panes() -> list[dict]:
     """
     connection = await iterm2.Connection.async_create()
     try:
-        return await describe_panes(connection)
+        panes = await describe_panes(connection)
+        panes.extend({"label": label, "session_id": None, "thread_id": rec["thread_id"],
+                      "transport": "mailbox", "job": "codex", "cwd": rec.get("cwd"),
+                      "auto_delivery": rec.get("auto_delivery", False)}
+                     for label, rec in registry.all_labels().items() if rec.get("transport") == "mailbox")
+        return panes
     finally:
         try:
             connection.close()
         except Exception:
             pass
+
+
+@mcp.tool()
+async def channel_ready(nonce: str) -> dict:
+    """Confirm receipt of this connection's actual native channel handshake."""
+    if not mcp._channel_pump:
+        return {"error": "no native channel on this MCP connection"}
+    return mcp._channel_pump.confirm(nonce)
+
+
+@mcp.tool()
+async def retry_delivery(job_id: str, label: str = "") -> dict:
+    """Retry a known failed delivery to this caller; never resend ambiguous/accepted input."""
+    caller = _caller_label()
+    label = label or caller
+    if not caller or label != caller:
+        return {"error": "only the receiving session can retry its delivery"}
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", job_id):
+        return {"error": "invalid job_id"}
+    from .mailbox_worker import read_delivery, _write_state, ensure_worker
+    path = _mailbox_dir(label, "inbox") / f"{job_id}.json"
+    with (_mailbox_dir(label, "locks") / f"{job_id}.delivery.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"error": "delivery currently in progress"}
+        state = read_delivery(label, job_id)
+        if state.get("state") not in ("failed", "retry"):
+            return {"error": "only a known failed attempt may be retried; inspect uncertain or accepted deliveries"}
+        if not path.exists():
+            return {"error": "message is no longer pending"}
+        record = json.loads(path.read_text())
+        endpoint = registry.lookup(label)
+        if not endpoint or record.get("recipient_thread_id") != endpoint.get("thread_id"):
+            return {"error": "recipient owner changed"}
+        _write_state(label, job_id, {"state": "queued", "previous_error": state.get("error")})
+    if endpoint.get("auto_delivery"):
+        ensure_worker()
+    return {"job_id": job_id, "state": "queued", "automatic": bool(endpoint.get("auto_delivery"))}
+
+
+@mcp.tool()
+async def connection_status() -> dict:
+    """Show this caller's automatically registered address and receiving mode."""
+    label = _caller_label()
+    record = registry.lookup(label) if label else None
+    if not record:
+        return {"ready": False, "error": "caller identity unavailable; pass a real thread ID to register_mailbox or register the actual iTerm pane"}
+    from .claude_channel import channel_ready as is_channel_ready
+    from .pane_delivery import legacy_input_enabled
+    native_channel = record.get("transport") == "claude-channel" or bool(record.get("session_id"))
+    ready = is_channel_ready(record) if native_channel and not legacy_input_enabled() else bool(record.get("auto_delivery") or record.get("session_id"))
+    return {"label": label, "ready": ready,
+            "identity_source": "request_meta" if request_thread_id() else "environment",
+            "thread_id": record.get("thread_id"),
+            "session_id": record.get("session_id"), "transport": "claude-channel" if native_channel and not legacy_input_enabled() else record.get("transport", "iterm"),
+            "channel_state": record.get("channel", {}).get("state", "not_connected") if native_channel else None,
+            "auto_delivery": ready if native_channel and not legacy_input_enabled() else record.get("auto_delivery", bool(record.get("session_id"))),
+            "policy": "native-queue" if native_channel and not legacy_input_enabled() else record.get("delivery_policy"),
+            "setup_error": record.get("setup_error")}
+
+
+@mcp.tool()
+async def reply(job_id: str, question: str, label: str = "") -> str:
+    """Reply to a received question by ID; preserve routing and conversation.
+
+    Repeating a completed reply does not send another message. An interrupted
+    dispatch is reported as uncertain, never blindly sent again.
+    """
+    label = label.strip() or _caller_label()
+    if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", part) for part in (label, job_id)):
+        return "ERROR: caller label and valid job_id are required"
+    if not question.strip():
+        return "ERROR: reply cannot be empty"
+    state_path = _mailbox_dir(label, "responses") / f"{job_id}.json"
+    lock = _mailbox_dir(label, "locks") / f"{job_id}.reply.lock"
+    with lock.open("a") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "ERROR: another reply to this question is in progress"
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        if state.get("state") == "sent":
+            _move_to_processed(label, job_id, {"status": "completed", "reply": state["reply"],
+                                              "finished_at": _now_iso(), "delivery_result": state["result"]})
+            return f"already replied: {job_id} ({state['result']})"
+        if state.get("state") == "dispatching":
+            return "ERROR: previous reply delivery is uncertain; inspect recipient before retrying"
+        original = None
+        for sub in ("inbox", "processed", "history"):
+            path = _mailbox_dir(label, sub) / f"{job_id}.json"
+            if path.exists():
+                original = json.loads(path.read_text())
+                if original.get("from_"):
+                    break
+        if not original or not original.get("from_") or original["from_"] == "unknown":
+            return "ERROR: original question sender is unavailable"
+        def save(state):
+            tmp = state_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False))
+            tmp.replace(state_path)
+        save({"state": "dispatching", "reply": question, "to": original["from_"]})
+        result = await _ask_async(question, target=original["from_"], in_reply_to=job_id,
+                                  conversation_id=original.get("conversation_id") or job_id)
+        if result.startswith("ERROR:"):
+            save({"state": "failed", "error": result})
+            return result
+        save({"state": "sent", "reply": question, "result": result})
+        _move_to_processed(label, job_id, {"status": "completed", "reply": question,
+                                          "finished_at": _now_iso(), "delivery_result": result})
+        return result
+
+
+@mcp.tool()
+async def configure_mailbox_delivery(label: str, policy: str = "idle", enabled: bool = True) -> dict:
+    """Enable automatic local Codex delivery: idle queues while busy; immediate steers.
+
+    Only the owning CODEX_THREAD_ID may configure its mailbox. No pane is created.
+    """
+    if policy not in ("idle", "immediate"):
+        return {"error": "policy must be idle or immediate"}
+    owner = current_thread_id()
+    endpoint = registry.lookup(label)
+    if not owner or not endpoint or endpoint.get("thread_id") != owner:
+        return {"error": "only the owning Codex thread can configure delivery"}
+    from .codex_transport import AppServer, default_socket
+    if enabled:
+        try:
+            async with AppServer(default_socket()) as rpc:
+                thread = (await rpc.request("thread/read", {"threadId": owner, "includeTurns": False}))["thread"]
+                if thread.get("id") != owner or not thread.get("canAcceptDirectInput"):
+                    return {"error": "thread does not accept direct input"}
+        except Exception as e:
+            return {"error": f"app-server connection failed: {e}"}
+    with registry._exclusive_lock():
+        data = registry.load()
+        if data.get(label) != endpoint:
+            return {"error": "registration changed; try again"}
+        data[label].update(auto_delivery=enabled, delivery_policy=policy, socket_path=default_socket())
+        if enabled:
+            data[label].pop("setup_error", None)
+            data[label]["cwd"] = thread.get("cwd")
+        registry._save_raw(data)
+    if enabled:
+        from .mailbox_worker import ensure_worker
+        pid = ensure_worker()
+        return {"label": label, "policy": policy, "enabled": True, "worker_pid": pid}
+    return {"label": label, "enabled": False}
+
+
+@mcp.tool()
+async def mailbox_status(label: str) -> dict:
+    """Inspect registration and pending message delivery; queued is not replied."""
+    from .mailbox_worker import read_delivery, RUN_DIR
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", label):
+        return {"error": "invalid mailbox label"}
+    result = {"endpoint": registry.lookup(label), "messages": []}
+    result["connection"] = read_delivery(label, "connection")
+    for record in _list_inbox(label):
+        result["messages"].append({"job_id": record["job_id"], "from_": record.get("from_"),
+                                   "delivery": record.get("channel_delivery") or record.get("pane_delivery") or read_delivery(label, record["job_id"]) or {"state": "queued"}})
+    try:
+        result["worker"] = json.loads((RUN_DIR / "mailbox-worker.json").read_text())
+    except (OSError, ValueError):
+        result["worker"] = None
+    return result
+
+
+@mcp.tool()
+async def register_mailbox(label: str = "", thread_id: str = "") -> str:
+    """Register a pane-free Codex thread's durable inbox.
+
+    The receiver reads messages with inbox(label=label). This does not
+    inject a prompt or wake an idle thread. Existing pane labels are protected.
+    """
+    thread_id = thread_id.strip() or current_thread_id()
+    if not thread_id:
+        return "ERROR: thread_id or CODEX_THREAD_ID is required"
+    if not label:
+        owned = [name for name, rec in registry.all_labels().items()
+                 if rec.get("transport") == "mailbox" and rec.get("thread_id") == thread_id]
+        label = owned[0] if len(owned) == 1 else f"codex-{thread_id}"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", label):
+        return "ERROR: label must contain only letters, digits, underscores or hyphens"
+    try:
+        registry.register_mailbox(label, thread_id, os.getcwd())
+    except (ValueError, OSError) as e:
+        return f"ERROR: {e}"
+    return f"registered mailbox '{label}' for thread {thread_id}; receive via inbox(label='{label}')"
 
 
 @mcp.tool()
@@ -1109,6 +1557,8 @@ async def register_self(label: str = "") -> str:
     """
     tsid = os.environ.get("TERM_SESSION_ID", "")
     sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    if request_thread_id() or (current_thread_id() and not sid_tail):
+        return await register_mailbox(label)
     if not sid_tail:
         return "ERROR: no TERM_SESSION_ID — are you running inside iTerm?"
 
@@ -1175,6 +1625,14 @@ async def broadcast(message: str, targets: Optional[list[str]] = None) -> str:
 
     If ``targets`` is omitted, broadcasts to claude+codex (legacy mode).
     """
+    from .pane_delivery import legacy_input_enabled
+    if not legacy_input_enabled():
+        if not targets:
+            return "ERROR: explicit registered target labels are required"
+        results = {}
+        for target in targets:
+            results[target] = await _ask_async("Broadcast notice (no reply required): " + message, target=target)
+        return json.dumps(results, ensure_ascii=False)
     connection = await iterm2.Connection.async_create()
     try:
         sent: list[str] = []
@@ -1295,7 +1753,15 @@ def _auto_register_from_env() -> None:
     tsid = os.environ.get("TERM_SESSION_ID", "")
     sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
     if not sid_tail:
-        return
+        if current_thread_id():
+            asyncio.run(_bootstrap_caller())
+            return
+        # Some wrappers drop TERM_SESSION_ID; only use actual ancestor TTYs.
+        from .cli import _resolve_caller_sid_tail
+        sid_tail = _resolve_caller_sid_tail()
+        if not sid_tail:
+            _log.event("auto_register.deferred", reason="waiting for request threadId")
+            return
 
     async def _go():
         try:
@@ -1331,6 +1797,8 @@ def _auto_register_from_env() -> None:
             # Make the chosen label visible to the *current* server
             # process — used as `from_agent` in queue records.
             os.environ["TEAMMATE_LABEL"] = label
+            global _startup_pane
+            _startup_pane = {"label": label, "session_id": me.session_id}
             _log.event("auto_register", label=label,
                        session_id=me.session_id, auto=not explicit)
         finally:

@@ -422,3 +422,39 @@ def test_despawn_does_not_unregister_reused_label_when_old_sid_is_gone(monkeypat
 
     assert rc == 0
     assert saved == {}
+
+
+def test_register_pane_uses_live_sid_fallback_when_term_session_id_missing(monkeypatch):
+    monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+
+    seen = []
+
+    def fake_resolve(sid_tail):
+        seen.append(sid_tail)
+        return "LIVE-SID"
+
+    monkeypatch.setattr(cli, "_resolve_live_sid_via_ppid", fake_resolve)
+    monkeypatch.setattr(cli.asyncio, "run", lambda coro: coro.close() or 0)
+
+    rc = cli._cmd_register_pane([])
+
+    assert rc == 0
+    assert seen == ["", "LIVE-SID"]
+
+
+def test_whoami_uses_live_sid_fallback_when_term_session_id_missing(monkeypatch, capsys):
+    monkeypatch.delenv("TERM_SESSION_ID", raising=False)
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+
+    monkeypatch.setattr(cli, "_resolve_live_sid_via_ppid", lambda sid_tail: "LIVE-SID")
+    monkeypatch.setattr(
+        registry,
+        "all_labels",
+        lambda: {"worker1": {"session_id": "LIVE-SID"}},
+    )
+
+    rc = cli._cmd_whoami()
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "worker1"

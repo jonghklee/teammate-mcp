@@ -1,0 +1,5 @@
+#!/bin/sh
+# Start a separate Claude session with native teammate channel notifications.
+# Claude itself presents the local-development channel approval dialog.
+unset TEAMMATE_LEGACY_PANE_INPUT CODEX_THREAD_ID CODEX_SESSION_ID TEAMMATE_LABEL
+exec claude --dangerously-load-development-channels server:teammate "$@"

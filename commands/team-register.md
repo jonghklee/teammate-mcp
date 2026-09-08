@@ -1,12 +1,7 @@
 ---
-description: "Register THIS pane in teammate-mcp via the CLI (no MCP round-trip)."
+description: "Check automatic teammate registration, or apply the requested label."
 ---
 
-Run this exact bash command and print its output verbatim:
-
-```bash
-/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp register-pane
-```
-
-The CLI prints `✓ registered as <label> (...)`. That's the answer.
-Then end the turn. Do not call any MCP tool.
+Read and follow `/Users/siheom-yong/programming/teammate-mcp/skills/team-register.md`.
+Use connection_status for automatic setup. Apply an explicit label if supplied.
+Report the actual address and readiness. Do not guess a different pane.

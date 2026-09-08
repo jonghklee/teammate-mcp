@@ -155,7 +155,7 @@ async def test_injected_ask_prompt_recommends_mcp_reply_not_bash(tmp_path, monke
 
     await server._ask_async("hello", target="receiver", mailbox_only=False)
 
-    assert "mcp__teammate__ask(target='sender'" in captured["body"]
+    assert "mcp__teammate__reply(job_id=" in captured["body"]
     assert "teammate-mcp ask sender" not in captured["body"]
 
 
@@ -223,3 +223,8 @@ async def test_inject_falls_back_to_mailbox_if_typing_never_settles(tmp_path, mo
     assert "file-fallback" in answer            # deferred to mailbox/hook
     inbox = list((tmp_path / "mailbox" / "receiver" / "inbox").glob("*.json"))
     assert len(inbox) == 1                       # durable copy kept for hook
+
+
+@pytest.fixture(autouse=True)
+def explicit_legacy_transport(monkeypatch):
+    monkeypatch.setenv("TEAMMATE_LEGACY_PANE_INPUT", "1")

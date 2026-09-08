@@ -26,6 +26,9 @@ import os
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from teammate_mcp.pane_delivery import available_to_hook, hook_delivery_lock
+
 REGISTRY = Path.home() / ".teammate-mcp" / "registry.json"
 MAILBOX = Path.home() / ".teammate-mcp" / "mailbox"
 LOG = Path.home() / ".teammate-mcp" / "logs" / "hook-drain.log"
@@ -63,7 +66,7 @@ def _resolve_label() -> str:
         return ""
     for label, rec in reg.items():
         rec_sid = (rec.get("session_id") or "").upper()
-        if rec_sid == sid_tail or rec_sid.endswith(sid_tail) or sid_tail.endswith(rec_sid):
+        if rec_sid and (rec_sid == sid_tail or rec_sid.endswith(sid_tail) or sid_tail.endswith(rec_sid)):
             return label
     return ""
 
@@ -77,7 +80,7 @@ def _log(line: str) -> None:
         pass
 
 
-def main() -> int:
+def _main_unlocked() -> int:
     # Read (and discard) Claude Code's stdin JSON event. We don't need
     # any field from it; the hook's effect is purely additive context.
     try:
@@ -103,7 +106,7 @@ def main() -> int:
     if not inbox.exists():
         return 0
 
-    files = sorted(inbox.glob("*.json"))
+    files = [p for p in sorted(inbox.glob("*.json")) if available_to_hook(p)]
     if not files:
         return 0
     max_attach = _env_int("TEAMMATE_HOOK_MAX_ATTACH", DEFAULT_MAX_ATTACH)
@@ -131,7 +134,7 @@ def main() -> int:
                 f"After this hook finishes, read the full JSON at {processed_hint}]"
             )
         instr = (
-            f"To reply: `mcp__teammate__ask(target='{sender}', "
+            f"To reply: `mcp__teammate__reply(job_id='{jid}', label='{label}', "
             f"question='<reply>')`. "
             f"Do not use Bash or write XML/tool tags for teammate replies. "
             f"After replying, optionally call "
@@ -175,6 +178,14 @@ def main() -> int:
     print(out)
     _log(f"drained {len(blocks)} for label={label} deferred={len(deferred)}")
     return 0
+
+
+def main() -> int:
+    label = _resolve_label()
+    if not label:
+        return 0
+    with hook_delivery_lock(MAILBOX, label) as acquired:
+        return _main_unlocked() if acquired else 0
 
 
 if __name__ == "__main__":

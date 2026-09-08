@@ -54,3 +54,16 @@ def test_all_labels_returns_everything():
     registry.register("b", "222", 999999, "codex")
     labels = registry.all_labels()
     assert set(labels.keys()) == {"a", "b"}
+
+
+def test_lock_timeout_never_permits_unlocked_write(tmp_path, monkeypatch):
+    import errno
+    monkeypatch.setattr(registry, "LOCK_PATH", tmp_path / "lock")
+    ticks = iter([0.0, 11.0])
+    monkeypatch.setattr(registry.time, "monotonic", lambda: next(ticks))
+    def locked(*args):
+        raise BlockingIOError(errno.EAGAIN, "held by another writer")
+    monkeypatch.setattr(registry.fcntl, "flock", locked)
+    with pytest.raises(TimeoutError):
+        registry.register("new", "sid", 1, "codex")
+    assert not registry.REGISTRY_PATH.exists()

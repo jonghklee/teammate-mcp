@@ -18,4 +18,4 @@ if [ -n "$_TM_LABEL" ] && [[ "$_TM_LABEL" != "("* ]]; then
     export TEAMMATE_LABEL="$_TM_LABEL"
     echo "exported TEAMMATE_LABEL=$_TM_LABEL" >> "$DBG"
 fi
-exec claude --dangerously-skip-permissions
+exec claude --dangerously-load-development-channels server:teammate --dangerously-skip-permissions

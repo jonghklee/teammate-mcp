@@ -44,7 +44,13 @@ class MessageQueue:
         self.mode = mode
         if base is None:
             if mode == "audit":
-                base = Path.cwd() / ".queue"
+                # Path.cwd() can raise PermissionError under the macOS sandbox;
+                # fall back to $PWD / home so audit mode still has a base dir.
+                try:
+                    cwd = Path.cwd()
+                except OSError:
+                    cwd = Path(os.environ.get("PWD") or Path.home())
+                base = cwd / ".queue"
             else:
                 base = Path(tempfile.mkdtemp(prefix="teammate-mcp-"))
                 # auto-clean ephemeral dirs unless caller provides their own.

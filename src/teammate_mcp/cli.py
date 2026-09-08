@@ -748,7 +748,19 @@ def _cmd_spawn(argv: list[str]) -> int:
             mode = "window"
 
     # cwd resolution + existence check
-    cwd_path = Path(cwd_arg).expanduser() if cwd_arg else Path.cwd()
+    if cwd_arg:
+        cwd_path = Path(cwd_arg).expanduser()
+    else:
+        # Path.cwd() can raise PermissionError under the macOS sandbox; honour
+        # TEAMMATE_CWD / $PWD before giving up so this command stays usable.
+        try:
+            cwd_path = Path.cwd()
+        except OSError:
+            cwd_path = Path(
+                os.environ.get("TEAMMATE_CWD")
+                or os.environ.get("PWD")
+                or Path.home()
+            )
     cwd_abs = cwd_path.resolve()
     if not cwd_abs.is_dir():
         print(f"ERROR: cwd does not exist or is not a directory: {cwd_abs}",
@@ -1328,6 +1340,113 @@ def _proc_info_for_tty(tty: str) -> tuple[str, str]:
     return (job, cwd)
 
 
+def _live_iterm_sessions() -> dict:
+    """Return ``{"/dev/ttysNNN": "<UNIQUE-ID>"}`` for every live iTerm
+    session — iTerm's own ground truth, immune to a stale env id.
+    """
+    import subprocess
+    script = '''
+tell application "iTerm"
+    set out to ""
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                set out to out & (tty of s) & " " & (unique id of s) & linefeed
+            end repeat
+        end repeat
+    end repeat
+    return out
+end tell
+'''
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception:
+        return {}
+    m: dict = {}
+    for ln in (out.stdout or "").splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) != 2:
+            continue
+        tty, sid = parts[0], parts[1]
+        m[tty] = sid
+    return m
+
+
+def _resolve_live_sid_via_ppid(env_sid_tail: str) -> Optional[str]:
+    """Stale-proof session resolution.
+
+    ``$TERM_SESSION_ID`` lies in two situations: after an iTerm restart
+    (the env id points at a session iTerm no longer owns), and when the
+    process runs on a wrapper pty (e.g. ``claude-chill`` allocates its
+    own pty, so the process's controlling tty differs from the pane's).
+    In both cases the env id matches no live iTerm session.
+
+    Walk THIS process's parent chain and return the unique id of the
+    first ancestor whose controlling tty belongs to a live iTerm
+    session. The climb is what defeats the wrapper-pty case: it keeps
+    going up past the wrapper until it reaches the process iTerm itself
+    launched on the pane's real pty.
+
+    Returns ``None`` when the env id is already live (no override needed)
+    or when nothing in the chain maps to a live session (caller keeps
+    the env id and its existing error handling).
+    """
+    import subprocess
+    live = _live_iterm_sessions()  # {/dev/ttysNNN: unique-id}
+    if not live:
+        return None
+    live_ids = {v.upper() for v in live.values()}
+    if env_sid_tail and env_sid_tail.upper() in live_ids:
+        return None  # env id is live — nothing to fix
+    pid = os.getpid()
+    for _ in range(25):
+        try:
+            tty = subprocess.run(
+                ["ps", "-o", "tty=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip()
+        except Exception:
+            break
+        if tty and tty != "??":
+            dev = tty if tty.startswith("/dev/") else f"/dev/{tty}"
+            if dev in live:
+                return live[dev]
+        try:
+            ppid = int(subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip())
+        except Exception:
+            break
+        if ppid <= 1:
+            break
+        pid = ppid
+    return None
+
+
+def _resolve_caller_sid_tail() -> str:
+    """Best-effort iTerm session-id tail for the current process.
+
+    Prefers ``TERM_SESSION_ID``, then ``ITERM_SESSION_ID``. If either one is
+    missing or stale, fall back to resolving the parent process chain against
+    the live iTerm session map.
+    """
+    for env_name in ("TERM_SESSION_ID", "ITERM_SESSION_ID"):
+        tsid = os.environ.get(env_name, "")
+        sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+        if not sid_tail:
+            continue
+        live_sid = _resolve_live_sid_via_ppid(sid_tail)
+        return live_sid or sid_tail
+    return _resolve_live_sid_via_ppid("") or ""
+
+
 def _cmd_register_pane(argv: list[str]) -> int:
     """Register the calling shell's iTerm pane — no LLM in the loop.
 
@@ -1341,11 +1460,21 @@ def _cmd_register_pane(argv: list[str]) -> int:
         explicit_label = argv[0]
     explicit_label = explicit_label or os.environ.get("TEAMMATE_LABEL", "").strip()
 
-    tsid = os.environ.get("TERM_SESSION_ID", "")
-    sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    sid_tail = _resolve_caller_sid_tail()
     if not sid_tail:
-        print("ERROR: no TERM_SESSION_ID — are you running inside iTerm?", file=sys.stderr)
+        print("ERROR: could not resolve an iTerm session for this pane.", file=sys.stderr)
         return 2
+
+    # Stale-proof override: if $TERM_SESSION_ID points at a session iTerm
+    # no longer owns (restart) or the process runs on a wrapper pty
+    # (claude-chill) whose id differs from the pane's, resolve the real
+    # live session via the parent-process tty chain and use that instead.
+    # No-op (returns None) when the env id is already a live session.
+    _live_sid = _resolve_live_sid_via_ppid(sid_tail)
+    if _live_sid:
+        print(f"(note: TERM_SESSION_ID …{sid_tail[-8:]} stale → resolved live "
+              f"session …{_live_sid[-8:]} via process tree)", file=sys.stderr)
+        sid_tail = _live_sid
 
     # Auto-prune stale entries before this register so dead claudeN/codexN
     # numbers are recycled instead of monotonically growing. The prune
@@ -1552,14 +1681,13 @@ def _cmd_unregister(argv: list[str]) -> int:
 def _cmd_whoami() -> int:
     """Print the label of the calling pane (or "(unregistered)").
 
-    Resolves the calling shell's TERM_SESSION_ID against the registry.
+    Resolves the calling shell's iTerm session against the registry.
     Useful inside an agent: "내가 누구야?" → bash → teammate-mcp whoami.
     """
     from . import registry
-    tsid = os.environ.get("TERM_SESSION_ID", "")
-    sid_tail = (tsid.split(":", 1)[1] if ":" in tsid else tsid).upper()
+    sid_tail = _resolve_caller_sid_tail().upper()
     if not sid_tail:
-        print("(no TERM_SESSION_ID — not running inside iTerm)")
+        print("(no iTerm session — not running inside iTerm)")
         return 2
     for label, rec in registry.all_labels().items():
         rec_sid = (rec.get("session_id") or "").upper()
@@ -2056,7 +2184,7 @@ def _cmd_install_iterm() -> int:
 def _cmd_statusline() -> int:
     """Print this pane's teammate label for Claude Code's statusLine.
 
-    Looks up the calling shell's TERM_SESSION_ID in the registry and
+    Looks up the calling shell's iTerm session in the registry and
     emits a one-line summary. Claude Code reads stdin (a JSON blob with
     cwd/model/etc) on every turn and renders our stdout under the
     prompt. We ignore stdin and print whatever's most useful.
@@ -2070,8 +2198,7 @@ def _cmd_statusline() -> int:
         pass
 
     from . import registry
-    tsid = os.environ.get("TERM_SESSION_ID", "")
-    sid_tail = tsid.split(":", 1)[1] if ":" in tsid else tsid
+    sid_tail = _resolve_caller_sid_tail()
     sid_up = sid_tail.upper() if sid_tail else ""
 
     label = None

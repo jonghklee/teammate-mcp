@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# tmreg [label] — stale-proof, agent-safe teammate-mcp registration.
+#
+# WHY: after an iTerm restart (or whenever a long-lived process is wrapped
+# by claude-chill / a pty allocator), $TERM_SESSION_ID and the process's
+# own controlling tty both point at a session iTerm NO LONGER OWNS. The
+# normal `teammate-mcp register-pane` trusts $TERM_SESSION_ID, can't find
+# the pane, and fails or mis-attaches the label to the wrong session.
+#
+# HOW: ignore $TERM_SESSION_ID entirely. Ask iTerm for its CURRENT live
+# {tty -> session-id} map, then walk THIS process's parent chain; the
+# first ancestor whose controlling tty appears in iTerm's live map is the
+# real pane. Register with that live id via a TERM_SESSION_ID override.
+#
+# This works even from an agent's sandboxed Bash tool (which itself has no
+# tty) because it climbs ppids until it reaches the shell/wrapper that
+# iTerm actually launched (e.g. claude-chill on the pane's real pty).
+set -euo pipefail
+
+LABEL="${1:-}"
+TM="${TEAMMATE_MCP_BIN:-teammate-mcp}"
+command -v "$TM" >/dev/null 2>&1 || TM="/Users/siheom-yong/programming/teammate-mcp/.venv/bin/teammate-mcp"
+
+# 1) iTerm's live tty -> session-id map (ground truth, never stale).
+MAP="$(osascript -e 'tell application "iTerm2"
+set out to ""
+repeat with w in windows
+ repeat with t in tabs of w
+  repeat with s in sessions of t
+   set out to out & (tty of s) & " " & (id of s) & linefeed
+  end repeat
+ end repeat
+end repeat
+return out
+end tell' 2>/dev/null)" || {
+  echo "ERROR: could not query iTerm (running? Automation permission?)." >&2; exit 4; }
+
+# 2) Climb the parent chain; first ancestor tty present in iTerm's map wins.
+pid=$$
+LIVE=""
+for _ in $(seq 1 25); do
+  tty="$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')"
+  if [ -n "$tty" ] && [ "$tty" != "??" ]; then
+    hit="$(printf '%s\n' "$MAP" | awk -v t="/dev/$tty" '$1==t{print $2; exit}')"
+    [ -n "$hit" ] && { LIVE="$hit"; break; }
+  fi
+  ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  { [ -z "$ppid" ] || [ "$ppid" -le 1 ] 2>/dev/null; } && break
+  pid="$ppid"
+done
+
+if [ -z "$LIVE" ]; then
+  echo "ERROR: no ancestor process maps to a live iTerm session." >&2
+  echo "  This pane may not be an iTerm session, or iTerm lost it." >&2
+  exit 5
+fi
+
+echo "resolved live iTerm session = $LIVE"
+TERM_SESSION_ID="x:$LIVE" "$TM" register-pane ${LABEL:+"$LABEL"}
+echo -n "whoami: "; TERM_SESSION_ID="x:$LIVE" "$TM" whoami
